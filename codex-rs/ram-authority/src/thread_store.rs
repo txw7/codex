@@ -65,6 +65,7 @@ pub struct RamJournalThreadStore {
     journal: JournalWriter,
     journal_states: Mutex<HashMap<ThreadId, Arc<AsyncMutex<ThreadJournalState>>>>,
     history_modes: Mutex<HashMap<ThreadId, ThreadHistoryMode>>,
+    bootstrap_params: Mutex<HashMap<ThreadId, CreateThreadParams>>,
 }
 
 impl RamJournalThreadStore {
@@ -74,6 +75,7 @@ impl RamJournalThreadStore {
             journal: JournalWriter::new(journal_root),
             journal_states: Mutex::new(HashMap::new()),
             history_modes: Mutex::new(HashMap::new()),
+            bootstrap_params: Mutex::new(HashMap::new()),
         }
     }
 
@@ -108,20 +110,25 @@ impl ThreadStore for RamJournalThreadStore {
     }
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
-        let thread_id = params.thread_id;
+        let thread_id = params.thread_id.clone();
         let history_mode = params.history_mode;
+        let bootstrap = params.clone();
         Box::pin(async move {
             ThreadStore::create_thread(self.resident.as_ref(), params).await?;
             self.history_modes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(thread_id, history_mode);
+                .insert(thread_id.clone(), history_mode);
+            self.bootstrap_params
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(thread_id, bootstrap);
             Ok(())
         })
     }
 
     fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
-        let thread_id = params.thread_id;
+        let thread_id = params.thread_id.clone();
         let history_mode = params
             .history
             .as_deref()
@@ -176,10 +183,27 @@ impl ThreadStore for RamJournalThreadStore {
             };
 
             let sequence = state.next_sequence;
+            let bootstrap = if sequence == 1 {
+                Some(
+                    self.bootstrap_params
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .get(&thread_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            internal_error(
+                                "first RamJournal commit is missing CreateThreadParams bootstrap",
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
             let frame = encode_turn_frame(
                 thread_id.clone(),
                 &sealed.turn_id,
                 sequence,
+                bootstrap.as_ref(),
                 &sealed.items,
             )
             .map_err(internal_error)?;

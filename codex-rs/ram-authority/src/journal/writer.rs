@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn one_frame_uses_one_application_write_call() {
         let frame =
-            encode_turn_frame(ThreadId::new(), "turn-1", 1, &[]).expect("frame should encode");
+            encode_turn_frame(ThreadId::new(), "turn-1", 1, None, &[]).expect("frame should encode");
         let mut writer = CountingWriter::default();
 
         write_frame_once(&mut writer, &frame.bytes).expect("write should succeed");
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn short_write_faults_instead_of_looping() {
         let frame =
-            encode_turn_frame(ThreadId::new(), "turn-1", 1, &[]).expect("frame should encode");
+            encode_turn_frame(ThreadId::new(), "turn-1", 1, None, &[]).expect("frame should encode");
         let mut writer = CountingWriter {
             short_by: 1,
             ..Default::default()
@@ -144,7 +144,7 @@ mod tests {
         let writer = JournalWriter::new(temp.path().to_path_buf());
         let thread_id = ThreadId::new();
         let frame =
-            encode_turn_frame(thread_id, "turn-1", 1, &[]).expect("frame should encode");
+            encode_turn_frame(thread_id, "turn-1", 1, None, &[]).expect("frame should encode");
 
         writer
             .append_turn_frame(thread_id, &frame)

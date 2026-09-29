@@ -2,6 +2,7 @@ use std::io::Cursor;
 
 use codex_protocol::ThreadId;
 use codex_rollout::RolloutItem;
+use codex_thread_store::CreateThreadParams;
 
 const FRAME_MAGIC: &[u8; 8] = b"CJR1TURN";
 const FRAME_END_MAGIC: &[u8; 8] = b"CJR1END!";
@@ -42,6 +43,7 @@ pub fn encode_turn_frame(
     thread_id: ThreadId,
     turn_id: &str,
     sequence: u64,
+    bootstrap: Option<&CreateThreadParams>,
     items: &[RolloutItem],
 ) -> Result<EncodedTurnFrame, JournalFormatError> {
     let payload = serde_json::to_vec(&serde_json::json!({
@@ -49,6 +51,7 @@ pub fn encode_turn_frame(
         "thread_id": thread_id.to_string(),
         "turn_id": turn_id,
         "sequence": sequence,
+        "bootstrap": bootstrap,
         "items": items,
     }))?;
     let compressed = zstd::stream::encode_all(Cursor::new(&payload), 1)?;
@@ -85,9 +88,9 @@ mod tests {
     fn identical_terminal_turns_encode_identically() {
         let thread_id = ThreadId::new();
         let first =
-            encode_turn_frame(thread_id, "turn-1", 1, &[]).expect("first frame should encode");
+            encode_turn_frame(thread_id, "turn-1", 1, None, &[]).expect("first frame should encode");
         let second =
-            encode_turn_frame(thread_id, "turn-1", 1, &[]).expect("second frame should encode");
+            encode_turn_frame(thread_id, "turn-1", 1, None, &[]).expect("second frame should encode");
 
         // JOURNAL-NOTE: deterministic bytes make duplicate-commit detection a
         // content check rather than an interpretive exercise involving clocks.
@@ -98,7 +101,7 @@ mod tests {
     #[test]
     fn frame_has_explicit_boundaries_and_declared_payload_length() {
         let frame =
-            encode_turn_frame(ThreadId::new(), "turn-1", 7, &[]).expect("frame should encode");
+            encode_turn_frame(ThreadId::new(), "turn-1", 7, None, &[]).expect("frame should encode");
 
         assert!(frame.bytes.starts_with(FRAME_MAGIC));
         assert!(frame.bytes.ends_with(FRAME_END_MAGIC));

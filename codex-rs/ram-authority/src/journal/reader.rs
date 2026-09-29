@@ -131,15 +131,20 @@ impl JournalReader {
                 }
                 let path = entry.path();
                 let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-                    return Err(JournalReadError::InvalidJournalFilename { path });
+                    return Err(JournalReadError::InvalidJournalFilename {
+                        path: path.clone(),
+                    });
                 };
-                let thread_id = ThreadId::from_string(stem)
-                    .map_err(|_| JournalReadError::InvalidJournalFilename { path })?;
+                let thread_id = ThreadId::from_string(stem).map_err(|_| {
+                    JournalReadError::InvalidJournalFilename {
+                        path: path.clone(),
+                    }
+                })?;
                 ids.push(thread_id);
             }
         }
 
-        ids.sort_by_key(ToString::to_string);
+        ids.sort_by_key(|thread_id| thread_id.to_string());
         ids.dedup();
         Ok(ids)
     }

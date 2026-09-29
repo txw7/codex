@@ -119,6 +119,15 @@ impl PendingTurn {
         Ok(())
     }
 
+    /// Snapshot the still-open canonical items for an explicit history read.
+    ///
+    /// FORK-RAM: the pending turn remains decoded because it is active hot
+    /// state. The clone exists only for APIs that explicitly request history;
+    /// it is not another retained cache.
+    pub fn items(&self) -> Vec<RolloutItem> {
+        self.items.clone()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }

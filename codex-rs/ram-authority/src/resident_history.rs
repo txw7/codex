@@ -54,6 +54,27 @@ impl ResidentHistories {
             .push(frame);
     }
 
+    /// Replace one thread's resident committed history from a verified cold
+    /// journal load.
+    ///
+    /// RESIDENCY-NOTE: replacement happens as one metadata operation after the
+    /// complete frame set has been validated. Readers never observe a
+    /// half-hydrated history assembled one frame at a time.
+    pub fn replace(
+        &self,
+        thread_id: ThreadId,
+        frames: impl IntoIterator<Item = EncodedTurnFrame>,
+    ) {
+        let mut history = ResidentHistory::default();
+        for frame in frames {
+            history.push(frame);
+        }
+        self.threads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(thread_id, history);
+    }
+
     pub fn with<R>(
         &self,
         thread_id: ThreadId,

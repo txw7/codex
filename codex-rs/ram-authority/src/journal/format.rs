@@ -54,6 +54,10 @@ impl JournalFormatError {
 /// remains an invariant instead of a slogan.
 #[derive(Clone, Debug)]
 pub struct EncodedTurnFrame {
+    pub thread_id: ThreadId,
+    pub turn_id: String,
+    pub sequence: u64,
+    pub previous_digest: Option<[u8; 32]>,
     pub bytes: Arc<[u8]>,
     pub digest: [u8; 32],
     pub compressed_len: u64,
@@ -101,6 +105,10 @@ pub fn encode_turn_frame(
     bytes.extend_from_slice(FRAME_END_MAGIC);
 
     Ok(EncodedTurnFrame {
+        thread_id,
+        turn_id: turn_id.to_string(),
+        sequence,
+        previous_digest,
         bytes: Arc::from(bytes),
         digest,
         compressed_len,

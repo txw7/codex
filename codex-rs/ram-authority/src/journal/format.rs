@@ -75,3 +75,38 @@ pub fn encode_turn_frame(
         uncompressed_len,
     })
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identical_terminal_turns_encode_identically() {
+        let thread_id = ThreadId::new();
+        let first =
+            encode_turn_frame(thread_id, "turn-1", 1, &[]).expect("first frame should encode");
+        let second =
+            encode_turn_frame(thread_id, "turn-1", 1, &[]).expect("second frame should encode");
+
+        // JOURNAL-NOTE: deterministic bytes make duplicate-commit detection a
+        // content check rather than an interpretive exercise involving clocks.
+        assert_eq!(first.bytes, second.bytes);
+        assert_eq!(first.digest, second.digest);
+    }
+
+    #[test]
+    fn frame_has_explicit_boundaries_and_declared_payload_length() {
+        let frame =
+            encode_turn_frame(ThreadId::new(), "turn-1", 7, &[]).expect("frame should encode");
+
+        assert!(frame.bytes.starts_with(FRAME_MAGIC));
+        assert!(frame.bytes.ends_with(FRAME_END_MAGIC));
+        assert_eq!(
+            frame.bytes.len(),
+            FIXED_HEADER_BYTES
+                + usize::try_from(frame.compressed_len).expect("compressed length should fit")
+                + FIXED_FOOTER_BYTES
+        );
+    }
+}

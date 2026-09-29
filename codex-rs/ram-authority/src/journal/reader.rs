@@ -54,8 +54,33 @@ pub enum JournalReadError {
 /// A truncated final frame is not included in `frames`; `valid_bytes` points
 /// to the exact byte boundary after the last complete verified frame.
 #[derive(Debug)]
+#[derive(Clone, Debug)]
+pub struct RecoveredFrame {
+    pub encoded: super::EncodedTurnFrame,
+    pub bootstrap: Option<CreateThreadParams>,
+    pub terminal_digest: [u8; 32],
+    offset: usize,
+}
+
+impl RecoveredFrame {
+    pub fn decode(&self) -> Result<DecodedTurnFrame, JournalReadError> {
+        let (decoded, consumed) = decode_turn_frame(self.encoded.bytes.as_ref())
+            .map_err(|source| JournalReadError::Corrupt {
+                offset: self.offset,
+                source,
+            })?;
+        if consumed != self.encoded.bytes.len() {
+            return Err(JournalReadError::Corrupt {
+                offset: self.offset,
+                source: JournalFormatError::InvalidFooter,
+            });
+        }
+        Ok(decoded)
+    }
+}
+
 pub struct RecoveredJournal {
-    pub frames: Vec<DecodedTurnFrame>,
+    pub frames: Vec<RecoveredFrame>,
     pub valid_bytes: usize,
     pub truncated_tail: bool,
 }
@@ -65,21 +90,27 @@ impl RecoveredJournal {
         self.frames.first().and_then(|frame| frame.bootstrap.as_ref())
     }
 
-    pub fn items(&self) -> Vec<RolloutItem> {
-        self.frames
-            .iter()
-            .flat_map(|frame| frame.items.iter().cloned())
-            .collect()
+    /// Explicitly materialize the complete decoded history.
+    ///
+    /// RESIDENCY-NOTE: this is an escape hatch for APIs whose contract returns a
+    /// full Vec<RolloutItem>. RecoveredJournal itself retains compressed frames
+    /// only; decoded item graphs are not canonical resident state.
+    pub fn items(&self) -> Result<Vec<RolloutItem>, JournalReadError> {
+        let mut items = Vec::new();
+        for frame in &self.frames {
+            items.extend(frame.decode()?.items);
+        }
+        Ok(items)
     }
 
     pub fn last_digest(&self) -> Option<[u8; 32]> {
-        self.frames.last().map(|frame| frame.digest)
+        self.frames.last().map(|frame| frame.encoded.digest)
     }
 
     pub fn next_sequence(&self) -> u64 {
         self.frames
             .last()
-            .and_then(|frame| frame.sequence.checked_add(1))
+            .and_then(|frame| frame.encoded.sequence.checked_add(1))
             .unwrap_or(1)
     }
 }
@@ -228,6 +259,23 @@ pub fn recover_bytes(
             });
         }
 
+        let encoded = super::EncodedTurnFrame {
+            thread_id: frame.thread_id,
+            turn_id: frame.turn_id.clone(),
+            sequence: frame.sequence,
+            previous_digest: frame.previous_digest,
+            bytes: Arc::from(bytes[offset..offset + consumed].to_vec()),
+            digest: frame.digest,
+            compressed_len: frame.compressed_len,
+            uncompressed_len: frame.uncompressed_len,
+        };
+        let recovered = RecoveredFrame {
+            encoded,
+            bootstrap: frame.bootstrap,
+            terminal_digest: terminal.digest,
+            offset,
+        };
+
         expected_previous_digest = Some(frame.digest);
         expected_sequence = expected_sequence
             .checked_add(1)
@@ -245,7 +293,7 @@ pub fn recover_bytes(
                     available: bytes.len(),
                 },
             })?;
-        frames.push(frame);
+        frames.push(recovered);
     }
 
     Ok(RecoveredJournal {

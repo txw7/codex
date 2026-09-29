@@ -127,6 +127,8 @@ pub struct DecodedTurnFrame {
     pub bootstrap: Option<CreateThreadParams>,
     pub items: Vec<RolloutItem>,
     pub digest: [u8; 32],
+    pub compressed_len: u64,
+    pub uncompressed_len: u64,
 }
 
 /// Decode exactly one CJR V1 frame from the beginning of `bytes`.
@@ -255,6 +257,8 @@ pub fn decode_turn_frame(
             bootstrap,
             items,
             digest: declared_digest,
+            compressed_len,
+            uncompressed_len,
         },
         frame_end,
     ))

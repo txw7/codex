@@ -65,6 +65,29 @@ impl JournalWriter {
     pub fn thread_path(&self, thread_id: ThreadId) -> PathBuf {
         super::journal_thread_path(self.root(), thread_id)
     }
+
+    /// Truncate an incomplete terminal tail to the last verified frame boundary.
+    ///
+    /// JOURNAL-NOTE: callers may use this only after JournalReader proved the
+    /// complete prefix. This is tail cleanup, not a general-purpose history
+    /// editing API. Canonical journals are append-only; corruption does not get
+    /// a convenient rewrite function because that would be extremely tempting.
+    pub fn truncate_to_verified_prefix(
+        &self,
+        thread_id: ThreadId,
+        valid_bytes: usize,
+    ) -> Result<(), JournalWriteError> {
+        let path = self.thread_path(thread_id);
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(u64::try_from(valid_bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "verified journal length does not fit in u64",
+            )
+        })?)?;
+        file.sync_data()?;
+        Ok(())
+    }
 }
 
 fn write_frame_once(

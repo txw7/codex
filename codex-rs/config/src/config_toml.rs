@@ -562,6 +562,15 @@ pub struct ConfigToml {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThreadStoreToml {
     Local {},
+    // UPSTREAM-SEAM: RamJournal is a production fork backend selected through
+    // the same config boundary upstream already owns.
+    //
+    // Keep this variant boring. If upstream changes thread-store selection,
+    // move the adapter instead of teaching the rest of config about our storage
+    // religion.
+    RamJournal {
+        id: String,
+    },
     #[schemars(skip)]
     InMemory {
         id: String,

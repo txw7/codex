@@ -28,9 +28,11 @@ use codex_thread_store::ThreadPage;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::ThreadStoreFuture;
+use codex_thread_store::ThreadStoreResult;
 use codex_thread_store::UpdateThreadMetadataParams;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::journal::JournalReader;
 use crate::journal::JournalWriter;
 use crate::journal::encode_turn_frame;
 use crate::pending_turn::PendingTurn;
@@ -65,6 +67,7 @@ impl Default for ThreadJournalState {
 pub struct RamJournalThreadStore {
     resident: Arc<InMemoryThreadStore>,
     journal: JournalWriter,
+    reader: JournalReader,
     journal_states: Mutex<HashMap<ThreadId, Arc<AsyncMutex<ThreadJournalState>>>>,
     history_modes: Mutex<HashMap<ThreadId, ThreadHistoryMode>>,
     bootstrap_params: Mutex<HashMap<ThreadId, CreateThreadParams>>,
@@ -74,7 +77,8 @@ impl RamJournalThreadStore {
     pub fn new(id: &str, journal_root: PathBuf) -> Self {
         Self {
             resident: InMemoryThreadStore::for_id(id),
-            journal: JournalWriter::new(journal_root),
+            journal: JournalWriter::new(journal_root.clone()),
+            reader: JournalReader::new(journal_root),
             journal_states: Mutex::new(HashMap::new()),
             history_modes: Mutex::new(HashMap::new()),
             bootstrap_params: Mutex::new(HashMap::new()),
@@ -90,6 +94,76 @@ impl RamJournalThreadStore {
             .entry(thread_id)
             .or_insert_with(|| Arc::new(AsyncMutex::new(ThreadJournalState::default())))
             .clone()
+    }
+
+    async fn hydrate_from_journal(&self, thread_id: ThreadId) -> ThreadStoreResult<bool> {
+        let reader = self.reader.clone();
+        let read_thread_id = thread_id.clone();
+        let recovered = tokio::task::spawn_blocking(move || reader.recover_thread(read_thread_id))
+            .await
+            .map_err(|error| internal_error(format!("journal reader task failed: {error}")))?
+            .map_err(internal_error)?;
+
+        let Some(recovered) = recovered else {
+            return Ok(false);
+        };
+        if recovered.frames.is_empty() {
+            return Ok(false);
+        }
+
+        let bootstrap = recovered
+            .bootstrap()
+            .cloned()
+            .ok_or_else(|| internal_error("RamJournal sequence 1 is missing CreateThreadParams"))?;
+        if bootstrap.thread_id != thread_id {
+            return Err(internal_error(
+                "RamJournal bootstrap thread id does not match journal thread id",
+            ));
+        }
+
+        if recovered.truncated_tail {
+            let writer = self.journal.clone();
+            let truncate_thread_id = thread_id.clone();
+            let valid_bytes = recovered.valid_bytes;
+            tokio::task::spawn_blocking(move || {
+                writer.truncate_to_verified_prefix(truncate_thread_id, valid_bytes)
+            })
+            .await
+            .map_err(|error| internal_error(format!("journal tail cleanup task failed: {error}")))?
+            .map_err(internal_error)?;
+        }
+
+        // FORK-RAM: Cold hydration is the only journal-read phase for this
+        // resident lifetime. Reconstruct the complete logical history in RAM,
+        // then ordinary reads return to the resident store.
+        ThreadStore::create_thread(self.resident.as_ref(), bootstrap.clone()).await?;
+        let recovered_items = recovered.items();
+        if !recovered_items.is_empty() {
+            ThreadStore::append_items(
+                self.resident.as_ref(),
+                AppendThreadItemsParams {
+                    thread_id: thread_id.clone(),
+                    items: recovered_items,
+                },
+            )
+            .await?;
+        }
+
+        self.history_modes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(thread_id.clone(), bootstrap.history_mode);
+        self.bootstrap_params
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(thread_id.clone(), bootstrap);
+
+        let journal_state = self.journal_state(thread_id);
+        let mut state = journal_state.lock().await;
+        state.next_sequence = recovered.next_sequence();
+        state.last_digest = recovered.last_digest();
+
+        Ok(true)
     }
 }
 
@@ -137,11 +211,16 @@ impl ThreadStore for RamJournalThreadStore {
             .and_then(history_mode_from_items)
             .unwrap_or_default();
         Box::pin(async move {
+            if params.history.is_none() {
+                let _ = self.hydrate_from_journal(thread_id.clone()).await?;
+            }
+
             ThreadStore::resume_thread(self.resident.as_ref(), params).await?;
             self.history_modes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(thread_id, history_mode);
+                .entry(thread_id)
+                .or_insert(history_mode);
             Ok(())
         })
     }
@@ -264,18 +343,61 @@ impl ThreadStore for RamJournalThreadStore {
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredThreadHistory> {
-        ThreadStore::load_history(self.resident.as_ref(), params)
+        Box::pin(async move {
+            match ThreadStore::load_history(self.resident.as_ref(), params.clone()).await {
+                Ok(history) => Ok(history),
+                Err(ThreadStoreError::ThreadNotFound { .. }) => {
+                    if self.hydrate_from_journal(params.thread_id.clone()).await? {
+                        ThreadStore::load_history(self.resident.as_ref(), params).await
+                    } else {
+                        Err(ThreadStoreError::ThreadNotFound {
+                            thread_id: params.thread_id,
+                        })
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        })
     }
 
     fn load_latest_model_context(
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
-        ThreadStore::load_latest_model_context(self.resident.as_ref(), params)
+        Box::pin(async move {
+            match ThreadStore::load_latest_model_context(self.resident.as_ref(), params.clone()).await
+            {
+                Ok(context) => Ok(context),
+                Err(ThreadStoreError::ThreadNotFound { .. }) => {
+                    if self.hydrate_from_journal(params.thread_id.clone()).await? {
+                        ThreadStore::load_latest_model_context(self.resident.as_ref(), params).await
+                    } else {
+                        Err(ThreadStoreError::ThreadNotFound {
+                            thread_id: params.thread_id,
+                        })
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        })
     }
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
-        ThreadStore::read_thread(self.resident.as_ref(), params)
+        Box::pin(async move {
+            match ThreadStore::read_thread(self.resident.as_ref(), params.clone()).await {
+                Ok(thread) => Ok(thread),
+                Err(ThreadStoreError::ThreadNotFound { .. }) => {
+                    if self.hydrate_from_journal(params.thread_id.clone()).await? {
+                        ThreadStore::read_thread(self.resident.as_ref(), params).await
+                    } else {
+                        Err(ThreadStoreError::ThreadNotFound {
+                            thread_id: params.thread_id,
+                        })
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        })
     }
 
     fn read_thread_by_rollout_path(

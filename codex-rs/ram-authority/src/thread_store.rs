@@ -332,6 +332,7 @@ impl ThreadStore for RamJournalThreadStore {
             )
             .map_err(internal_error)?;
 
+            let frame_digest = frame.digest;
             let writer = journal.clone();
             let write_thread_id = thread_id.clone();
             tokio::task::spawn_blocking(move || {
@@ -352,7 +353,7 @@ impl ThreadStore for RamJournalThreadStore {
                     .committed_terminals
                     .insert(terminal.turn_id, terminal.digest);
             }
-            state.last_digest = Some(frame.digest);
+            state.last_digest = Some(frame_digest);
             state.next_sequence = state
                 .next_sequence
                 .checked_add(1)

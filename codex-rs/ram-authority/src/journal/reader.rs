@@ -79,6 +79,7 @@ impl RecoveredFrame {
     }
 }
 
+#[derive(Debug)]
 pub struct RecoveredJournal {
     pub frames: Vec<RecoveredFrame>,
     pub valid_bytes: usize,

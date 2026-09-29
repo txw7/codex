@@ -79,6 +79,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
+use codex_ram_authority::build_bootstrap_thread_store;
 use codex_rollout::state_db::StateDbHandle;
 use codex_skills_extension::HostSkillsService;
 use codex_thread_store::InMemoryThreadStore;
@@ -496,6 +497,13 @@ pub fn thread_store_from_config(
             }
             store
         }
+        // UPSTREAM-SEAM: Keep the fork backend at upstream's existing
+        // thread-store composition point.
+        //
+        // Phase 01 intentionally does not pass StateDbHandle into RamJournal.
+        // Session authority is RAM-owned; SQLite does not get to cosplay as a
+        // required execution substrate because it happened to be in scope.
+        ThreadStoreConfig::RamJournal { id } => build_bootstrap_thread_store(id),
         ThreadStoreConfig::InMemory { id } => {
             Arc::new(InMemoryThreadStore::for_id(id).with_state_db(state_db))
         }

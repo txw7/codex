@@ -1,0 +1,16 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-ram-authority"
+version.workspace = true
+
+[lib]
+name = "codex_ram_authority"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+codex-thread-store = { workspace = true }

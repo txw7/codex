@@ -5,6 +5,7 @@
 //! Later phases replace that representation behind this crate boundary with
 //! compressed resident frames and terminal-turn journal commits.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 mod journal;
@@ -27,11 +28,15 @@ pub use thread_store::RamJournalThreadStore;
 ///
 /// Replacing the boring proof with the clever implementation before the proof
 /// works would be an excellent way to debug four architectures simultaneously.
-pub fn build_bootstrap_thread_store(id: &str) -> Arc<dyn ThreadStore> {
-    // SQLITE-NOTE: RamJournal owns its resident thread semantics without a
-    // StateDbHandle. The wrapper delegates to upstream's in-memory behavior
-    // today and becomes the journal interception point in Phase 02.
-    Arc::new(RamJournalThreadStore::new(id))
+pub fn build_bootstrap_thread_store(
+    id: &str,
+    codex_home: PathBuf,
+) -> Arc<dyn ThreadStore> {
+    // AUTHORITY-NOTE: CODEX_HOME determines journal placement, not thread
+    // identity. Thread identity remains ThreadId; placement can move later
+    // without asking pathnames to become ontology.
+    let journal_root = codex_home.join("ram-journal");
+    Arc::new(RamJournalThreadStore::new(id, journal_root))
 }
 
 #[cfg(test)]
@@ -40,7 +45,10 @@ mod tests {
 
     #[test]
     fn bootstrap_backend_is_the_explicit_in_memory_authority() {
-        let store = build_bootstrap_thread_store("ram-authority-bootstrap-test");
+        let store = build_bootstrap_thread_store(
+            "ram-authority-bootstrap-test",
+            std::env::temp_dir(),
+        );
 
         // FORK-INVARIANT: the production selection now resolves to the
         // fork-owned wrapper, not directly to an upstream backend.

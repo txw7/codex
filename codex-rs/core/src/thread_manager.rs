@@ -503,7 +503,11 @@ pub fn thread_store_from_config(
         // Phase 01 intentionally does not pass StateDbHandle into RamJournal.
         // Session authority is RAM-owned; SQLite does not get to cosplay as a
         // required execution substrate because it happened to be in scope.
-        ThreadStoreConfig::RamJournal { id } => build_bootstrap_thread_store(id),
+        ThreadStoreConfig::RamJournal { id } => {
+            // AUTHORITY-NOTE: codex_home supplies placement only. RamJournal
+            // never stores the absolute path as semantic thread identity.
+            build_bootstrap_thread_store(id, config.codex_home.to_path_buf())
+        },
         ThreadStoreConfig::InMemory { id } => {
             Arc::new(InMemoryThreadStore::for_id(id).with_state_db(state_db))
         }

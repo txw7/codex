@@ -87,6 +87,22 @@ impl ResidentHistories {
         f(threads.get(&thread_id))
     }
 
+    /// Clone only the frame metadata and Arc handles needed by an explicit
+    /// decode operation. Compressed payload bytes remain shared.
+    pub fn frames(&self, thread_id: ThreadId) -> Vec<EncodedTurnFrame> {
+        self.with(thread_id, |history| {
+            history
+                .map(|history| history.frames().to_vec())
+                .unwrap_or_default()
+        })
+    }
+
+    pub fn compressed_bytes(&self, thread_id: ThreadId) -> usize {
+        self.with(thread_id, |history| {
+            history.map(ResidentHistory::compressed_bytes).unwrap_or(0)
+        })
+    }
+
     pub fn remove(&self, thread_id: ThreadId) -> Option<ResidentHistory> {
         self.threads
             .lock()

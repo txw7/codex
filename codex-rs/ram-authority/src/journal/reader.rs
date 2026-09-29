@@ -259,11 +259,28 @@ pub fn recover_bytes(
 mod tests {
     use super::*;
     use crate::journal::encode_turn_frame;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::TurnCompleteEvent;
+
+    fn terminal(turn_id: &str) -> Vec<RolloutItem> {
+        vec![RolloutItem::EventMsg(EventMsg::TurnComplete(
+            TurnCompleteEvent {
+                turn_id: turn_id.to_string(),
+                last_agent_message: None,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            },
+        ))]
+    }
 
     #[test]
     fn recovers_a_verified_two_turn_chain() {
         let thread_id = ThreadId::new();
-        let first = encode_turn_frame(thread_id, "turn-1", 1, None, None, &[])
+        let first_items = terminal("turn-1");
+        let first = encode_turn_frame(thread_id, "turn-1", 1, None, None, &first_items)
             .expect("first frame");
         let second = encode_turn_frame(
             thread_id,
@@ -271,7 +288,7 @@ mod tests {
             2,
             Some(first.digest),
             None,
-            &[],
+            &terminal("turn-2"),
         )
         .expect("second frame");
         let mut bytes = first.bytes.clone();
@@ -308,7 +325,7 @@ mod tests {
             2,
             Some(first.digest),
             None,
-            &[],
+            &terminal("turn-2"),
         )
         .expect("second frame");
         let mut bytes = first.bytes.clone();

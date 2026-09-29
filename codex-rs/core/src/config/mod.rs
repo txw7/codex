@@ -602,6 +602,13 @@ pub enum ThreadStoreConfig {
     /// Persist threads locally using rollout JSONL files and sqlite metadata.
     #[default]
     Local,
+    /// FORK-RAM: Production RAM-authoritative session storage.
+    ///
+    /// Phase 01 keeps the complete logical thread expanded in memory. Later
+    /// phases replace that temporary representation with compressed resident
+    /// frames plus the terminal-turn journal without changing this selection
+    /// seam.
+    RamJournal { id: String },
     /// In-memory thread store for test and debug configurations.
     InMemory { id: String },
 }
@@ -2523,6 +2530,12 @@ fn resolve_tool_suggest_config_from_config(
 fn thread_store_config(thread_store: Option<ThreadStoreToml>) -> ThreadStoreConfig {
     match thread_store {
         Some(ThreadStoreToml::Local {}) => ThreadStoreConfig::Local,
+        // UPSTREAM-SEAM: Preserve upstream's config-layering machinery and
+        // translate only at the existing backend-resolution boundary.
+        //
+        // Future merge note: if upstream adds another backend, do not collapse
+        // it into RamJournal merely because both words contain "store".
+        Some(ThreadStoreToml::RamJournal { id }) => ThreadStoreConfig::RamJournal { id },
         Some(ThreadStoreToml::InMemory { id }) => ThreadStoreConfig::InMemory { id },
         None => ThreadStoreConfig::Local,
     }

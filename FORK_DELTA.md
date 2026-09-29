@@ -74,3 +74,43 @@ The first executable RamJournal slice is intentionally conservative:
 This is a proof scaffold, not the final representation.
 
 The next phase replaces expanded resident history with `PendingTurnV1` plus terminal CJR commits. Until that work lands, any comment claiming one-turn-one-append would be marketing, and this fork has enough maintenance obligations without maintaining fictional accomplishments.
+
+
+## Phase 02 terminal journal status
+
+RamJournal now owns an actual terminal-turn durability edge.
+
+Implemented:
+
+- ordinary upstream persistence checkpoints remain RAM-only fences;
+- canonical persisted RolloutItems accumulate in `PendingTurn`;
+- `TurnComplete` / `TurnAborted` seal one logical turn;
+- CJR V1 frames preserve upstream RolloutItem semantics;
+- each turn payload is independently zstd-compressed;
+- BLAKE3 protects each compressed payload;
+- frames carry a previous-frame digest for chain continuity;
+- sequence 1 carries `CreateThreadParams` bootstrap metadata;
+- the complete frame is assembled in RAM before I/O;
+- successful commit performs one application data `write()`, then `sync_data()`;
+- a short positive write faults instead of being completed by a write loop;
+- sealed resident state is released only after write + sync acknowledgement;
+- identical terminal retries are idempotent by turn id + terminal-event digest;
+- conflicting retries fail as `ThreadStoreError::Conflict`;
+- cold recovery validates frame format, thread id, sequence, digest chain, and terminal semantics;
+- only an incomplete final frame is treated as a recoverable tail;
+- a partial first-ever frame truncates back to zero durable bytes;
+- cold hydration rebuilds the upstream in-memory authority once, after which ordinary reads remain RAM-only;
+- Phase 02 `thread/list` can rediscover durable journals after resident RAM is gone.
+
+Explicitly **not** claimed yet:
+
+- cold historical frames are not yet kept compressed in resident RAM; recovery expands them;
+- decoded-history memory is not yet bounded;
+- `thread/list` currently gets correctness by eagerly hydrating cold journals;
+- memfd / strict swap containment is not implemented;
+- multi-process writer ownership/authority fencing is not implemented;
+- standalone archive/rename/revert/metadata administration is not yet CJR-durable;
+- Factory/Bifrost authority routing is not implemented;
+- local Cargo checks and focused Rust tests still need to be executed outside this GitHub-only editing surface.
+
+The final bullet is deliberately boring and therefore important. A test existing in source is not the same thing as a test having run. This fork is already opinionated enough without becoming metaphysical about CI receipts.

@@ -36,12 +36,14 @@ use crate::journal::JournalReader;
 use crate::journal::JournalWriter;
 use crate::journal::encode_turn_frame;
 use crate::pending_turn::PendingTurn;
+use crate::pending_turn::terminal_event_identity;
 
 #[derive(Debug)]
 struct ThreadJournalState {
     pending: PendingTurn,
     next_sequence: u64,
     last_digest: Option<[u8; 32]>,
+    committed_terminals: HashMap<String, [u8; 32]>,
 }
 
 impl Default for ThreadJournalState {
@@ -50,6 +52,7 @@ impl Default for ThreadJournalState {
             pending: PendingTurn::default(),
             next_sequence: 1,
             last_digest: None,
+            committed_terminals: HashMap::new(),
         }
     }
 }
@@ -141,6 +144,21 @@ impl RamJournalThreadStore {
         // resident lifetime. Reconstruct the complete logical history in RAM,
         // then ordinary reads return to the resident store.
         ThreadStore::create_thread(self.resident.as_ref(), bootstrap.clone()).await?;
+        let mut committed_terminals = HashMap::new();
+        for frame in &recovered.frames {
+            let terminal = terminal_event_identity(&frame.items)
+                .map_err(internal_error)?
+                .ok_or_else(|| internal_error("recovered CJR frame is missing terminal identity"))?;
+            if let Some(previous) =
+                committed_terminals.insert(terminal.turn_id.clone(), terminal.digest)
+            {
+                return Err(internal_error(format!(
+                    "journal contains duplicate durable turn id {} with digests {:x?} and {:x?}",
+                    terminal.turn_id, previous, terminal.digest
+                )));
+            }
+        }
+
         let recovered_items = recovered.items();
         if !recovered_items.is_empty() {
             ThreadStore::append_items(
@@ -166,6 +184,7 @@ impl RamJournalThreadStore {
         let mut state = journal_state.lock().await;
         state.next_sequence = recovered.next_sequence();
         state.last_digest = recovered.last_digest();
+        state.committed_terminals = committed_terminals;
 
         Ok(true)
     }
@@ -241,10 +260,6 @@ impl ThreadStore for RamJournalThreadStore {
             // its own turn sequence into two different versions of reality.
             let mut state = journal_state.lock().await;
 
-            // RAM remains primary. The resident store observes the canonical
-            // rollout items before the durability edge is considered.
-            ThreadStore::append_items(resident.as_ref(), params.clone()).await?;
-
             let history_mode = self
                 .history_modes
                 .lock()
@@ -253,6 +268,29 @@ impl ThreadStore for RamJournalThreadStore {
                 .copied()
                 .unwrap_or_default();
             let persisted_items = persisted_rollout_items(&params.items, history_mode);
+            let terminal = terminal_event_identity(&persisted_items).map_err(internal_error)?;
+
+            if let Some(terminal) = terminal.as_ref()
+                && let Some(committed_digest) =
+                    state.committed_terminals.get(&terminal.turn_id)
+            {
+                if committed_digest == &terminal.digest {
+                    // JOURNAL-NOTE: Lost acknowledgement retry. The same
+                    // terminal event is already durable, so do not mutate RAM
+                    // again and definitely do not append another frame.
+                    return Ok(());
+                }
+                return Err(ThreadStoreError::Conflict {
+                    message: format!(
+                        "turn {} is already durable with different terminal content",
+                        terminal.turn_id
+                    ),
+                });
+            }
+
+            // RAM remains primary. Only after retry/conflict checks does the
+            // resident store observe this append.
+            ThreadStore::append_items(resident.as_ref(), params.clone()).await?;
 
             // COMPAT-NOTE: The durable frame uses upstream's canonical
             // persistence filter. Raw transient events can remain useful to
@@ -309,6 +347,11 @@ impl ThreadStore for RamJournalThreadStore {
                 .pending
                 .mark_committed(&sealed.turn_id)
                 .map_err(internal_error)?;
+            if let Some(terminal) = terminal {
+                state
+                    .committed_terminals
+                    .insert(terminal.turn_id, terminal.digest);
+            }
             state.last_digest = Some(frame.digest);
             state.next_sequence = state
                 .next_sequence

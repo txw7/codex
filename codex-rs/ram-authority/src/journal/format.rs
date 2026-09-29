@@ -43,6 +43,7 @@ pub fn encode_turn_frame(
     thread_id: ThreadId,
     turn_id: &str,
     sequence: u64,
+    previous_digest: Option<[u8; 32]>,
     bootstrap: Option<&CreateThreadParams>,
     items: &[RolloutItem],
 ) -> Result<EncodedTurnFrame, JournalFormatError> {
@@ -51,6 +52,7 @@ pub fn encode_turn_frame(
         "thread_id": thread_id.to_string(),
         "turn_id": turn_id,
         "sequence": sequence,
+        "previous_digest": previous_digest,
         "bootstrap": bootstrap,
         "items": items,
     }))?;
@@ -88,9 +90,9 @@ mod tests {
     fn identical_terminal_turns_encode_identically() {
         let thread_id = ThreadId::new();
         let first =
-            encode_turn_frame(thread_id, "turn-1", 1, None, &[]).expect("first frame should encode");
+            encode_turn_frame(thread_id, "turn-1", 1, None, None, &[]).expect("first frame should encode");
         let second =
-            encode_turn_frame(thread_id, "turn-1", 1, None, &[]).expect("second frame should encode");
+            encode_turn_frame(thread_id, "turn-1", 1, None, None, &[]).expect("second frame should encode");
 
         // JOURNAL-NOTE: deterministic bytes make duplicate-commit detection a
         // content check rather than an interpretive exercise involving clocks.
@@ -101,7 +103,7 @@ mod tests {
     #[test]
     fn frame_has_explicit_boundaries_and_declared_payload_length() {
         let frame =
-            encode_turn_frame(ThreadId::new(), "turn-1", 7, None, &[]).expect("frame should encode");
+            encode_turn_frame(ThreadId::new(), "turn-1", 7, None, None, &[]).expect("frame should encode");
 
         assert!(frame.bytes.starts_with(FRAME_MAGIC));
         assert!(frame.bytes.ends_with(FRAME_END_MAGIC));

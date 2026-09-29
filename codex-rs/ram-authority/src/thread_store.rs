@@ -39,6 +39,7 @@ use crate::pending_turn::PendingTurn;
 struct ThreadJournalState {
     pending: PendingTurn,
     next_sequence: u64,
+    last_digest: Option<[u8; 32]>,
 }
 
 impl Default for ThreadJournalState {
@@ -46,6 +47,7 @@ impl Default for ThreadJournalState {
         Self {
             pending: PendingTurn::default(),
             next_sequence: 1,
+            last_digest: None,
         }
     }
 }
@@ -203,6 +205,7 @@ impl ThreadStore for RamJournalThreadStore {
                 thread_id.clone(),
                 &sealed.turn_id,
                 sequence,
+                state.last_digest,
                 bootstrap.as_ref(),
                 &sealed.items,
             )
@@ -223,6 +226,7 @@ impl ThreadStore for RamJournalThreadStore {
                 .pending
                 .mark_committed(&sealed.turn_id)
                 .map_err(internal_error)?;
+            state.last_digest = Some(frame.digest);
             state.next_sequence = state
                 .next_sequence
                 .checked_add(1)

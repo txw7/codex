@@ -124,6 +124,23 @@ use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
 
+#[test]
+fn ram_journal_config_resolves_without_collapsing_into_an_upstream_backend() {
+    let resolved = thread_store_config(Some(ThreadStoreToml::RamJournal {
+        id: "primary".to_string(),
+    }));
+
+    // FORK-INVARIANT: ram_journal must remain a distinct production backend.
+    // Mapping it to InMemory or Local here would make the config name an
+    // inspirational poster rather than an architecture.
+    assert_eq!(
+        resolved,
+        ThreadStoreConfig::RamJournal {
+            id: "primary".to_string(),
+        }
+    );
+}
+
 fn stdio_mcp(command: &str) -> McpServerConfig {
     stdio_mcp_with_args(command, &[])
 }

@@ -408,7 +408,43 @@ impl ThreadStore for RamJournalThreadStore {
     }
 
     fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage> {
-        ThreadStore::list_threads(self.resident.as_ref(), params)
+        Box::pin(async move {
+            let reader = self.reader.clone();
+            let durable_ids = tokio::task::spawn_blocking(move || reader.list_thread_ids())
+                .await
+                .map_err(|error| {
+                    internal_error(format!("journal discovery task failed: {error}"))
+                })?
+                .map_err(internal_error)?;
+
+            // RESIDENCY-NOTE: Phase 02 eagerly hydrates every cold durable thread
+            // before delegating list/filter/page semantics to the resident store.
+            //
+            // This is deliberately correct and deliberately expensive. Phase 03
+            // replaces it with a resident metadata catalog. Do not "optimize"
+            // this temporary path into a clever partial disk cache and then
+            // accidentally preserve the wrong architecture forever.
+            for thread_id in durable_ids {
+                match ThreadStore::read_thread(
+                    self.resident.as_ref(),
+                    ReadThreadParams {
+                        thread_id: thread_id.clone(),
+                        include_archived: true,
+                        include_history: false,
+                    },
+                )
+                .await
+                {
+                    Ok(_) => {}
+                    Err(ThreadStoreError::ThreadNotFound { .. }) => {
+                        let _ = self.hydrate_from_journal(thread_id).await?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+
+            ThreadStore::list_threads(self.resident.as_ref(), params).await
+        })
     }
 
     fn update_thread_metadata(

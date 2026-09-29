@@ -14,6 +14,7 @@ pub use format::decode_turn_frame;
 pub use format::encode_turn_frame;
 pub use reader::JournalReadError;
 pub use reader::JournalReader;
+pub use reader::RecoveredFrame;
 pub use reader::RecoveredJournal;
 pub use reader::recover_bytes;
 pub use writer::JournalWriteError;

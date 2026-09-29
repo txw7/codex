@@ -6,6 +6,9 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::RolloutItem;
+use codex_rollout::persisted_rollout_items;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::ArchiveThreadParams;
 use codex_thread_store::CreateThreadParams;
@@ -61,6 +64,7 @@ pub struct RamJournalThreadStore {
     resident: Arc<InMemoryThreadStore>,
     journal: JournalWriter,
     journal_states: Mutex<HashMap<ThreadId, Arc<AsyncMutex<ThreadJournalState>>>>,
+    history_modes: Mutex<HashMap<ThreadId, ThreadHistoryMode>>,
 }
 
 impl RamJournalThreadStore {
@@ -69,6 +73,7 @@ impl RamJournalThreadStore {
             resident: InMemoryThreadStore::for_id(id),
             journal: JournalWriter::new(journal_root),
             journal_states: Mutex::new(HashMap::new()),
+            history_modes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -84,6 +89,13 @@ impl RamJournalThreadStore {
     }
 }
 
+fn history_mode_from_items(items: &[RolloutItem]) -> Option<ThreadHistoryMode> {
+    items.iter().find_map(|item| match item {
+        RolloutItem::SessionMeta(meta) => Some(meta.meta.history_mode),
+        _ => None,
+    })
+}
+
 fn internal_error(error: impl std::fmt::Display) -> ThreadStoreError {
     ThreadStoreError::Internal {
         message: error.to_string(),
@@ -96,11 +108,33 @@ impl ThreadStore for RamJournalThreadStore {
     }
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
-        ThreadStore::create_thread(self.resident.as_ref(), params)
+        let thread_id = params.thread_id;
+        let history_mode = params.history_mode;
+        Box::pin(async move {
+            ThreadStore::create_thread(self.resident.as_ref(), params).await?;
+            self.history_modes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(thread_id, history_mode);
+            Ok(())
+        })
     }
 
     fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
-        ThreadStore::resume_thread(self.resident.as_ref(), params)
+        let thread_id = params.thread_id;
+        let history_mode = params
+            .history
+            .as_deref()
+            .and_then(history_mode_from_items)
+            .unwrap_or_default();
+        Box::pin(async move {
+            ThreadStore::resume_thread(self.resident.as_ref(), params).await?;
+            self.history_modes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(thread_id, history_mode);
+            Ok(())
+        })
     }
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
@@ -119,9 +153,21 @@ impl ThreadStore for RamJournalThreadStore {
             // rollout items before the durability edge is considered.
             ThreadStore::append_items(resident.as_ref(), params.clone()).await?;
 
+            let history_mode = self
+                .history_modes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&thread_id)
+                .copied()
+                .unwrap_or_default();
+            let persisted_items = persisted_rollout_items(&params.items, history_mode);
+
+            // COMPAT-NOTE: The durable frame uses upstream's canonical
+            // persistence filter. Raw transient events can remain useful to
+            // runtime observers without becoming surprise journal ontology.
             state
                 .pending
-                .push(&params.items)
+                .push(&persisted_items)
                 .map_err(internal_error)?;
 
             let Some(sealed) = state.pending.sealed() else {

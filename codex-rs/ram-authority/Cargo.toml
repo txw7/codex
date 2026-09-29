@@ -13,4 +13,5 @@ doctest = false
 workspace = true
 
 [dependencies]
+codex-protocol = { workspace = true }
 codex-thread-store = { workspace = true }

@@ -37,6 +37,7 @@ use crate::journal::JournalWriter;
 use crate::journal::encode_turn_frame;
 use crate::pending_turn::PendingTurn;
 use crate::pending_turn::terminal_event_identity;
+use crate::resident_history::ResidentHistories;
 
 #[derive(Debug)]
 struct ThreadJournalState {
@@ -74,6 +75,7 @@ pub struct RamJournalThreadStore {
     journal_states: Mutex<HashMap<ThreadId, Arc<AsyncMutex<ThreadJournalState>>>>,
     history_modes: Mutex<HashMap<ThreadId, ThreadHistoryMode>>,
     bootstrap_params: Mutex<HashMap<ThreadId, CreateThreadParams>>,
+    resident_histories: ResidentHistories,
 }
 
 impl RamJournalThreadStore {
@@ -85,6 +87,7 @@ impl RamJournalThreadStore {
             journal_states: Mutex::new(HashMap::new()),
             history_modes: Mutex::new(HashMap::new()),
             bootstrap_params: Mutex::new(HashMap::new()),
+            resident_histories: ResidentHistories::default(),
         }
     }
 
@@ -333,6 +336,7 @@ impl ThreadStore for RamJournalThreadStore {
             .map_err(internal_error)?;
 
             let frame_digest = frame.digest;
+            let resident_frame = frame.clone();
             let writer = journal.clone();
             let write_thread_id = thread_id.clone();
             tokio::task::spawn_blocking(move || {
@@ -341,6 +345,12 @@ impl ThreadStore for RamJournalThreadStore {
             .await
             .map_err(|error| internal_error(format!("journal writer task failed: {error}")))?
             .map_err(internal_error)?;
+
+            // RESIDENCY-NOTE: Promote exactly the bytes that were durably
+            // acknowledged. EncodedTurnFrame is Arc-backed, so this is metadata
+            // cloning rather than a second compressed payload allocation.
+            self.resident_histories
+                .push(thread_id, resident_frame);
 
             // JOURNAL-NOTE: Resident pending state advances only after the
             // complete frame has been appended and sync_data() has succeeded.

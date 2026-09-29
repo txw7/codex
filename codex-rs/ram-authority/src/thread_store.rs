@@ -476,3 +476,8 @@ impl ThreadStore for RamJournalThreadStore {
         ThreadStore::delete_thread(self.resident.as_ref(), params)
     }
 }
+
+
+#[cfg(test)]
+#[path = "thread_store_tests.rs"]
+mod tests;

@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::EventMsg;
@@ -140,6 +138,3 @@ async fn terminal_turn_survives_resident_authority_replacement() {
     let history = resident.history.expect("resident history");
     assert!(contains_terminal_turn(&history.items, "turn-1"));
 }
-
-#[allow(dead_code)]
-fn _pathbuf_type_receipt(_: PathBuf) {}

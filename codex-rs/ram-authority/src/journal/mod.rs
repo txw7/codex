@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use codex_protocol::ThreadId;
 
 mod format;
+mod reader;
 mod writer;
 
 pub use format::DecodedTurnFrame;
@@ -11,6 +12,10 @@ pub use format::EncodedTurnFrame;
 pub use format::JournalFormatError;
 pub use format::decode_turn_frame;
 pub use format::encode_turn_frame;
+pub use reader::JournalReadError;
+pub use reader::JournalReader;
+pub use reader::RecoveredJournal;
+pub use reader::recover_bytes;
 pub use writer::JournalWriteError;
 pub use writer::JournalWriter;
 

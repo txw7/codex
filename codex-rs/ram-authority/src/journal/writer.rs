@@ -63,9 +63,7 @@ impl JournalWriter {
     }
 
     pub fn thread_path(&self, thread_id: ThreadId) -> PathBuf {
-        let id = thread_id.to_string();
-        let prefix = id.get(..2).unwrap_or("00");
-        self.root.join("v1").join(prefix).join(format!("{id}.cjr"))
+        super::journal_thread_path(self.root(), thread_id)
     }
 }
 

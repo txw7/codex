@@ -11,6 +11,53 @@ pub enum PendingTurnError {
     AppendAfterTerminal { turn_id: String },
     #[error("commit acknowledgement for {actual} does not match sealed turn {expected}")]
     CommitTurnMismatch { expected: String, actual: String },
+    #[error("failed to encode terminal turn event: {0}")]
+    TerminalEncoding(#[from] serde_json::Error),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalEventIdentity {
+    pub turn_id: String,
+    pub digest: [u8; 32],
+}
+
+/// Identify the one terminal event carried by an append batch.
+///
+/// The digest covers the serialized terminal RolloutItem, not the full turn.
+/// That gives retry/idempotency handling a stable receipt even when a lost
+/// acknowledgement causes only the terminal event to be replayed.
+pub fn terminal_event_identity(
+    items: &[RolloutItem],
+) -> Result<Option<TerminalEventIdentity>, PendingTurnError> {
+    let mut terminal = None;
+
+    for item in items {
+        let turn_id = match item {
+            RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => Some(event.turn_id.clone()),
+            RolloutItem::EventMsg(EventMsg::TurnAborted(event)) => Some(
+                event
+                    .turn_id
+                    .clone()
+                    .ok_or(PendingTurnError::TerminalTurnMissingId)?,
+            ),
+            _ => None,
+        };
+
+        let Some(turn_id) = turn_id else {
+            continue;
+        };
+        if terminal.is_some() {
+            return Err(PendingTurnError::MultipleTerminalEvents);
+        }
+
+        let encoded = serde_json::to_vec(item)?;
+        terminal = Some(TerminalEventIdentity {
+            turn_id,
+            digest: *blake3::hash(&encoded).as_bytes(),
+        });
+    }
+
+    Ok(terminal)
 }
 
 #[derive(Debug, Clone)]
@@ -42,33 +89,10 @@ impl PendingTurn {
             });
         }
 
-        let mut terminal_turn_id = None;
-
-        for item in items {
-            let candidate = match item {
-                RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
-                    Some(event.turn_id.clone())
-                }
-                RolloutItem::EventMsg(EventMsg::TurnAborted(event)) => {
-                    Some(
-                        event
-                            .turn_id
-                            .clone()
-                            .ok_or(PendingTurnError::TerminalTurnMissingId)?,
-                    )
-                }
-                _ => None,
-            };
-
-            if let Some(candidate) = candidate {
-                if terminal_turn_id.replace(candidate).is_some() {
-                    return Err(PendingTurnError::MultipleTerminalEvents);
-                }
-            }
-        }
+        let terminal = terminal_event_identity(items)?;
 
         self.items.extend(items.iter().cloned());
-        self.terminal_turn_id = terminal_turn_id;
+        self.terminal_turn_id = terminal.map(|terminal| terminal.turn_id);
         Ok(())
     }
 

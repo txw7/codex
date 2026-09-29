@@ -8,8 +8,11 @@ use codex_protocol::protocol::TurnCompleteEvent;
 use codex_rollout::RolloutItem;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::CreateThreadParams;
+use codex_thread_store::ListThreadsParams;
 use codex_thread_store::PersistContext;
 use codex_thread_store::ReadThreadParams;
+use codex_thread_store::SortDirection;
+use codex_thread_store::ThreadSortKey;
 use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
@@ -222,4 +225,56 @@ async fn duplicate_terminal_retry_is_idempotent_after_cold_recovery() {
             .len(),
         committed_len
     );
+}
+
+
+#[tokio::test]
+async fn thread_list_discovers_a_cold_durable_journal_without_knowing_its_id() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().to_path_buf();
+    let thread_id = ThreadId::new();
+
+    let first = RamJournalThreadStore::new("list-writer", root.clone());
+    ThreadStore::create_thread(&first, create_thread_params(thread_id))
+        .await
+        .expect("create resident thread");
+    ThreadStore::append_items(
+        &first,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal_turn("turn-list")],
+        },
+    )
+    .await
+    .expect("terminal turn should commit");
+
+    // A different resident-store id has no in-memory knowledge of the thread.
+    // list_threads must discover the CJR namespace, verify/hydrate the thread,
+    // then delegate listing semantics to RAM.
+    let second = RamJournalThreadStore::new("list-reader", root);
+    let page = ThreadStore::list_threads(
+        &second,
+        ListThreadsParams {
+            page_size: 100,
+            cursor: None,
+            sort_key: ThreadSortKey::CreatedAt,
+            sort_direction: SortDirection::Desc,
+            allowed_sources: Vec::new(),
+            model_providers: None,
+            cwd_filters: None,
+            section: None,
+            project_id: None,
+            archived: false,
+            search_term: None,
+            relation_filter: None,
+            use_state_db_only: false,
+        },
+    )
+    .await
+    .expect("cold durable thread should be listable");
+
+    // RESIDENCY-NOTE: Phase 02 gets correctness by eagerly hydrating the cold
+    // journal. Phase 03 replaces this with a resident metadata catalog so
+    // listing does not deserialize an entire conversation just to draw a row.
+    assert!(page.items.iter().any(|thread| thread.thread_id == thread_id));
 }

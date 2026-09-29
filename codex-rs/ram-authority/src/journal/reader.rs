@@ -34,6 +34,8 @@ pub enum JournalReadError {
     },
     #[error("CJR frame at byte {offset} breaks the previous-digest chain")]
     ChainMismatch { offset: usize },
+    #[error("invalid CJR journal filename {path}")]
+    InvalidJournalFilename { path: PathBuf },
 }
 
 /// Longest verified journal prefix.
@@ -98,6 +100,48 @@ impl JournalReader {
             Err(error) => return Err(error.into()),
         };
         recover_bytes(thread_id, &bytes).map(Some)
+    }
+
+    /// Discover durable thread ids from the journal placement tree.
+    ///
+    /// COMPAT-NOTE: Phase 02 uses filename discovery only to bootstrap the
+    /// in-memory catalog after process restart. The pathname is still placement,
+    /// not semantic thread identity; every discovered id is revalidated against
+    /// the frame contents during recovery.
+    pub fn list_thread_ids(&self) -> Result<Vec<ThreadId>, JournalReadError> {
+        let v1 = self.root().join("v1");
+        let prefixes = match std::fs::read_dir(&v1) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut ids = Vec::new();
+        for prefix in prefixes {
+            let prefix = prefix?;
+            if !prefix.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(prefix.path())? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file()
+                    || entry.path().extension().and_then(|value| value.to_str()) != Some("cjr")
+                {
+                    continue;
+                }
+                let path = entry.path();
+                let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                    return Err(JournalReadError::InvalidJournalFilename { path });
+                };
+                let thread_id = ThreadId::from_string(stem)
+                    .map_err(|_| JournalReadError::InvalidJournalFilename { path })?;
+                ids.push(thread_id);
+            }
+        }
+
+        ids.sort_by_key(ToString::to_string);
+        ids.dedup();
+        Ok(ids)
     }
 }
 
@@ -228,6 +272,19 @@ mod tests {
         assert_eq!(recovered.frames.len(), 1);
         assert_eq!(recovered.valid_bytes, first.bytes.len());
         assert!(recovered.truncated_tail);
+    }
+
+    #[test]
+    fn discovers_thread_ids_from_the_v1_placement_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let reader = JournalReader::new(temp.path().to_path_buf());
+        let thread_id = ThreadId::new();
+        let path = super::super::journal_thread_path(reader.root(), thread_id);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(path, b"placeholder").expect("write placeholder");
+
+        let ids = reader.list_thread_ids().expect("list thread ids");
+        assert_eq!(ids, vec![thread_id]);
     }
 
     #[test]

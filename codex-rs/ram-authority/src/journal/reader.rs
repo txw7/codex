@@ -274,7 +274,7 @@ mod tests {
             &[],
         )
         .expect("second frame");
-        let mut bytes = first.bytes.clone();
+        let mut bytes = first.bytes.to_vec();
         bytes.extend_from_slice(&second.bytes);
 
         let recovered = recover_bytes(thread_id, &bytes).expect("journal should recover");
@@ -311,7 +311,7 @@ mod tests {
             &[],
         )
         .expect("second frame");
-        let mut bytes = first.bytes.clone();
+        let mut bytes = first.bytes.to_vec();
         bytes.extend_from_slice(&second.bytes[..second.bytes.len() / 2]);
 
         let recovered = recover_bytes(thread_id, &bytes).expect("tail should be recoverable");
@@ -339,7 +339,7 @@ mod tests {
         let thread_id = ThreadId::new();
         let frame = encode_turn_frame(thread_id, "turn-1", 1, None, None, &[])
             .expect("frame");
-        let mut bytes = frame.bytes;
+        let mut bytes = frame.bytes.to_vec();
         bytes[0] ^= 0xff;
 
         let error = recover_bytes(thread_id, &bytes).expect_err("corruption must fail");

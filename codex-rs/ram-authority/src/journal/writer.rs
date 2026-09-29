@@ -57,7 +57,7 @@ impl JournalWriter {
             .write(true)
             .open(path)?;
 
-        write_frame_once(&mut file, &frame.bytes)?;
+        write_frame_once(&mut file, frame.bytes.as_ref())?;
         file.sync_data()?;
         Ok(())
     }
@@ -135,12 +135,12 @@ mod tests {
             encode_turn_frame(ThreadId::new(), "turn-1", 1, None, None, &[]).expect("frame should encode");
         let mut writer = CountingWriter::default();
 
-        write_frame_once(&mut writer, &frame.bytes).expect("write should succeed");
+        write_frame_once(&mut writer, frame.bytes.as_ref()).expect("write should succeed");
 
         // IO-NOTE: If this becomes 2, somebody has changed the measured
         // persistence contract. Explain why before teaching the test humility.
         assert_eq!(writer.calls, 1);
-        assert_eq!(writer.bytes, frame.bytes);
+        assert_eq!(writer.bytes.as_slice(), frame.bytes.as_ref());
     }
 
     #[test]
@@ -152,7 +152,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = write_frame_once(&mut writer, &frame.bytes)
+        let err = write_frame_once(&mut writer, frame.bytes.as_ref())
             .expect_err("short write must fault the commit");
 
         assert!(matches!(err, JournalWriteError::ShortWrite { .. }));
@@ -172,6 +172,6 @@ mod tests {
             .expect("journal append should succeed");
 
         let bytes = std::fs::read(writer.thread_path(thread_id)).expect("read journal");
-        assert_eq!(bytes, frame.bytes);
+        assert_eq!(bytes.as_slice(), frame.bytes.as_ref());
     }
 }

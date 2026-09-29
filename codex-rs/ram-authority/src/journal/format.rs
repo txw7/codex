@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::sync::Arc;
 
 use codex_protocol::ThreadId;
 use codex_rollout::RolloutItem;
@@ -51,9 +52,9 @@ impl JournalFormatError {
 /// The writer is not allowed to serialize, append sidecars, or discover more
 /// metadata after this point. One immutable frame is how "one turn, one append"
 /// remains an invariant instead of a slogan.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EncodedTurnFrame {
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
     pub digest: [u8; 32],
     pub compressed_len: u64,
     pub uncompressed_len: u64,
@@ -100,7 +101,7 @@ pub fn encode_turn_frame(
     bytes.extend_from_slice(FRAME_END_MAGIC);
 
     Ok(EncodedTurnFrame {
-        bytes,
+        bytes: Arc::from(bytes),
         digest,
         compressed_len,
         uncompressed_len,
@@ -266,7 +267,7 @@ mod tests {
 
         // JOURNAL-NOTE: deterministic bytes make duplicate-commit detection a
         // content check rather than an interpretive exercise involving clocks.
-        assert_eq!(first.bytes, second.bytes);
+        assert_eq!(first.bytes.as_ref(), second.bytes.as_ref());
         assert_eq!(first.digest, second.digest);
     }
 

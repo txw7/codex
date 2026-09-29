@@ -9,6 +9,7 @@ use codex_thread_store::CreateThreadParams;
 use super::DecodedTurnFrame;
 use super::JournalFormatError;
 use super::decode_turn_frame;
+use crate::pending_turn::terminal_event_identity;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalReadError {
@@ -36,6 +37,16 @@ pub enum JournalReadError {
     ChainMismatch { offset: usize },
     #[error("invalid CJR journal filename {path}")]
     InvalidJournalFilename { path: PathBuf },
+    #[error("CJR frame at byte {offset} has invalid terminal semantics: {message}")]
+    InvalidTerminal { offset: usize, message: String },
+    #[error(
+        "CJR frame at byte {offset} declares turn {declared} but terminates turn {actual}"
+    )]
+    TerminalTurnMismatch {
+        offset: usize,
+        declared: String,
+        actual: String,
+    },
 }
 
 /// Longest verified journal prefix.
@@ -197,6 +208,26 @@ pub fn recover_bytes(
             return Err(JournalReadError::ChainMismatch { offset });
         }
 
+        let terminal = terminal_event_identity(&frame.items).map_err(|error| {
+            JournalReadError::InvalidTerminal {
+                offset,
+                message: error.to_string(),
+            }
+        })?;
+        let Some(terminal) = terminal else {
+            return Err(JournalReadError::InvalidTerminal {
+                offset,
+                message: "terminal frame contains no terminal RolloutItem".to_string(),
+            });
+        };
+        if terminal.turn_id != frame.turn_id {
+            return Err(JournalReadError::TerminalTurnMismatch {
+                offset,
+                declared: frame.turn_id.clone(),
+                actual: terminal.turn_id,
+            });
+        }
+
         expected_previous_digest = Some(frame.digest);
         expected_sequence = expected_sequence
             .checked_add(1)
@@ -253,6 +284,17 @@ mod tests {
         assert!(!recovered.truncated_tail);
         assert_eq!(recovered.next_sequence(), 3);
         assert_eq!(recovered.last_digest(), Some(second.digest));
+    }
+
+    #[test]
+    fn frame_without_terminal_semantics_is_rejected() {
+        let thread_id = ThreadId::new();
+        let frame = encode_turn_frame(thread_id, "turn-1", 1, None, None, &[])
+            .expect("frame");
+
+        let error = recover_bytes(thread_id, &frame.bytes)
+            .expect_err("a frame without a terminal RolloutItem is not a durable turn");
+        assert!(matches!(error, JournalReadError::InvalidTerminal { .. }));
     }
 
     #[test]

@@ -12,6 +12,7 @@ use codex_thread_store::PersistContext;
 use codex_thread_store::ReadThreadParams;
 use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadStore;
+use codex_thread_store::ThreadStoreError;
 
 use super::RamJournalThreadStore;
 
@@ -45,9 +46,13 @@ fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
 }
 
 fn terminal_turn(turn_id: &str) -> RolloutItem {
+    terminal_turn_with_message(turn_id, "done")
+}
+
+fn terminal_turn_with_message(turn_id: &str, message: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
         turn_id: turn_id.to_string(),
-        last_agent_message: Some("done".to_string()),
+        last_agent_message: Some(message.to_string()),
         error: None,
         started_at: None,
         completed_at: None,
@@ -137,4 +142,84 @@ async fn terminal_turn_survives_resident_authority_replacement() {
     // does not get an encore because somebody called read_thread twice.
     let history = resident.history.expect("resident history");
     assert!(contains_terminal_turn(&history.items, "turn-1"));
+}
+
+
+#[tokio::test]
+async fn duplicate_terminal_retry_is_idempotent_after_cold_recovery() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().to_path_buf();
+    let thread_id = ThreadId::new();
+    let journal_path = crate::journal::journal_thread_path(&root, thread_id);
+
+    let first = RamJournalThreadStore::new("idempotency-writer", root.clone());
+    ThreadStore::create_thread(&first, create_thread_params(thread_id))
+        .await
+        .expect("create resident thread");
+    ThreadStore::append_items(
+        &first,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal_turn("turn-idempotent")],
+        },
+    )
+    .await
+    .expect("first terminal commit");
+
+    let committed_len = std::fs::metadata(&journal_path)
+        .expect("journal metadata")
+        .len();
+
+    let second = RamJournalThreadStore::new("idempotency-reader", root);
+    ThreadStore::read_thread(
+        &second,
+        ReadThreadParams {
+            thread_id,
+            include_archived: true,
+            include_history: true,
+        },
+    )
+    .await
+    .expect("cold recovery should rebuild committed terminal receipts");
+
+    ThreadStore::append_items(
+        &second,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal_turn("turn-idempotent")],
+        },
+    )
+    .await
+    .expect("identical terminal retry should be a no-op");
+
+    assert_eq!(
+        std::fs::metadata(&journal_path)
+            .expect("journal metadata after retry")
+            .len(),
+        committed_len
+    );
+
+    let conflict = ThreadStore::append_items(
+        &second,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal_turn_with_message(
+                "turn-idempotent",
+                "different terminal content",
+            )],
+        },
+    )
+    .await
+    .expect_err("different terminal content for a durable turn id must conflict");
+
+    // JOURNAL-NOTE: turn identity is stable across acknowledgement loss.
+    // Same receipt => no-op. Same id, different receipt => conflict. We do not
+    // append both and leave the historian to choose a favorite.
+    assert!(matches!(conflict, ThreadStoreError::Conflict { .. }));
+    assert_eq!(
+        std::fs::metadata(&journal_path)
+            .expect("journal metadata after conflict")
+            .len(),
+        committed_len
+    );
 }

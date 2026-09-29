@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+mod journal;
 mod thread_store;
 
 use codex_thread_store::ThreadStore;

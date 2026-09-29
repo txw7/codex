@@ -96,6 +96,7 @@ members = [
     "voice-host",
     "protocol",
     "prompts",
+    "ram-authority",
     "rollout",
     "rollout-trace",
     "rmcp-client",
@@ -264,6 +265,7 @@ codex-model-provider = { path = "model-provider" }
 codex-process-hardening = { path = "process-hardening" }
 codex-protocol = { path = "protocol" }
 codex-prompts = { path = "prompts" }
+codex-ram-authority = { path = "ram-authority" }
 codex-queue-extension = { path = "ext/queue" }
 codex-responses-api-proxy = { path = "responses-api-proxy" }
 codex-response-debug-context = { path = "response-debug-context" }

@@ -107,6 +107,22 @@ impl RamJournalThreadStore {
         let Some(recovered) = recovered else {
             return Ok(false);
         };
+
+        if recovered.truncated_tail {
+            let writer = self.journal.clone();
+            let truncate_thread_id = thread_id.clone();
+            let valid_bytes = recovered.valid_bytes;
+            tokio::task::spawn_blocking(move || {
+                writer.truncate_to_verified_prefix(truncate_thread_id, valid_bytes)
+            })
+            .await
+            .map_err(|error| internal_error(format!("journal tail cleanup task failed: {error}")))?
+            .map_err(internal_error)?;
+        }
+
+        // A failed first-ever append has a verified prefix of zero bytes. Clean
+        // the partial tail above, then correctly report that no durable thread
+        // exists yet.
         if recovered.frames.is_empty() {
             return Ok(false);
         }
@@ -119,18 +135,6 @@ impl RamJournalThreadStore {
             return Err(internal_error(
                 "RamJournal bootstrap thread id does not match journal thread id",
             ));
-        }
-
-        if recovered.truncated_tail {
-            let writer = self.journal.clone();
-            let truncate_thread_id = thread_id.clone();
-            let valid_bytes = recovered.valid_bytes;
-            tokio::task::spawn_blocking(move || {
-                writer.truncate_to_verified_prefix(truncate_thread_id, valid_bytes)
-            })
-            .await
-            .map_err(|error| internal_error(format!("journal tail cleanup task failed: {error}")))?
-            .map_err(internal_error)?;
         }
 
         // FORK-RAM: Cold hydration is the only journal-read phase for this

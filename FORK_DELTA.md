@@ -1,0 +1,60 @@
+# Fork Delta Manifest
+
+This file is the maintained boundary between upstream Codex and the RAM-authority fork.
+
+## Baseline
+
+Repository: `txw7/codex`
+
+Upstream parent: `openai/codex`
+
+The implementation starts from real upstream ancestry. This sounds obvious because it is. We retain the sentence because we already explored the alternative timeline.
+
+## Stable invariants
+
+- loaded thread => complete logical session resident in RAM;
+- loaded thread => no journal reads during ordinary execution;
+- open turn => no persistent session-journal data writes;
+- terminal committed turn => exactly one positive application data append;
+- decoded history => bounded by hot-cache policy;
+- compressed history => complete for loaded thread;
+- catalog/index => derived, never canonical;
+- thread ID != endpoint identity;
+- Factory route => explicit authority generation;
+- compatibility resume => explicit compatible authority, never inferred fallback;
+- path != identity;
+- session-scoped SQLite projection != authority.
+
+## Permanent upstream seams
+
+Every permanent fork touchpoint gets an `UPSTREAM-SEAM` or `REBASE-NOTE` comment and an entry here.
+
+### RAM-TS-001
+
+Upstream symbol: `codex_config::config_toml::ThreadStoreToml`
+
+Fork behavior: adds `ram_journal` backend selection.
+
+Reason: select RAM-authoritative production storage through the same config seam upstream already owns.
+
+Fork implementation: `codex-rs/ram-authority`
+
+Merge rule: if upstream changes thread-store selection, move this adapter; do not spread backend selection through callers.
+
+### RAM-TS-002
+
+Upstream symbol: `codex_core::config::ThreadStoreConfig`
+
+Fork behavior: carries resolved RamJournal configuration through core.
+
+Reason: preserve upstream config layering while selecting fork-owned runtime behavior.
+
+### RAM-TS-003
+
+Upstream symbol: `codex_core::thread_manager::thread_store_from_config`
+
+Fork behavior: constructs the fork-owned RamJournal backend.
+
+Reason: keep backend composition at upstream's existing narrow boundary.
+
+Test expectation: Local and InMemory remain unchanged.

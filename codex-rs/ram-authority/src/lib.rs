@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 mod journal;
 mod pending_turn;
+mod resident_history;
 mod thread_store;
 
 use codex_thread_store::ThreadStore;

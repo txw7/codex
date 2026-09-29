@@ -7,8 +7,11 @@
 
 use std::sync::Arc;
 
-use codex_thread_store::InMemoryThreadStore;
+mod thread_store;
+
 use codex_thread_store::ThreadStore;
+
+pub use thread_store::RamJournalThreadStore;
 
 /// Build the Phase 01 RamJournal backend.
 ///
@@ -23,14 +26,10 @@ use codex_thread_store::ThreadStore;
 /// Replacing the boring proof with the clever implementation before the proof
 /// works would be an excellent way to debug four architectures simultaneously.
 pub fn build_bootstrap_thread_store(id: &str) -> Arc<dyn ThreadStore> {
-    let shared = InMemoryThreadStore::for_id(id);
-
-    // SQLITE-NOTE: Do not attach upstream StateDbHandle here.
-    //
-    // The Local backend remains available as the compatibility oracle. The RAM
-    // backend should not become "in memory, except for the database we quietly
-    // kept authoritative because it was nearby."
-    Arc::new(shared.with_state_db(None))
+    // SQLITE-NOTE: RamJournal owns its resident thread semantics without a
+    // StateDbHandle. The wrapper delegates to upstream's in-memory behavior
+    // today and becomes the journal interception point in Phase 02.
+    Arc::new(RamJournalThreadStore::new(id))
 }
 
 #[cfg(test)]
@@ -41,8 +40,8 @@ mod tests {
     fn bootstrap_backend_is_the_explicit_in_memory_authority() {
         let store = build_bootstrap_thread_store("ram-authority-bootstrap-test");
 
-        // FORK-INVARIANT: Phase 01 must resolve to a RAM-owned implementation,
-        // not LocalThreadStore with a more aspirational config name.
-        assert!(store.as_any().is::<InMemoryThreadStore>());
+        // FORK-INVARIANT: the production selection now resolves to the
+        // fork-owned wrapper, not directly to an upstream backend.
+        assert!(store.as_any().is::<RamJournalThreadStore>());
     }
 }

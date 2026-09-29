@@ -58,3 +58,19 @@ Fork behavior: constructs the fork-owned RamJournal backend.
 Reason: keep backend composition at upstream's existing narrow boundary.
 
 Test expectation: Local and InMemory remain unchanged.
+
+
+## Phase 01 bootstrap status
+
+The first executable RamJournal slice is intentionally conservative:
+
+- config selects a distinct `RamJournal` backend;
+- core constructs it only at `thread_store_from_config()`;
+- the fork-owned crate currently delegates canonical thread storage to upstream `InMemoryThreadStore`;
+- RamJournal explicitly does **not** attach `StateDbHandle` to that thread store;
+- complete history is still fully expanded in RAM;
+- no journal, compression, memfd arena, residency eviction, or Factory authority protocol is claimed yet.
+
+This is a proof scaffold, not the final representation.
+
+The next phase replaces expanded resident history with `PendingTurnV1` plus terminal CJR commits. Until that work lands, any comment claiming one-turn-one-append would be marketing, and this fork has enough maintenance obligations without maintaining fictional accomplishments.

@@ -9,7 +9,6 @@ mod thread_store;
 
 use std::sync::Arc;
 
-use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::ThreadStore;
 
 pub use thread_store::RamJournalThreadStore;
@@ -27,14 +26,13 @@ pub use thread_store::RamJournalThreadStore;
 /// Replacing the boring proof with the clever implementation before the proof
 /// works would be an excellent way to debug four architectures simultaneously.
 pub fn build_bootstrap_thread_store(id: &str) -> Arc<dyn ThreadStore> {
-    let shared = InMemoryThreadStore::for_id(id);
-
-    // SQLITE-NOTE: Do not attach upstream StateDbHandle here.
+    // FORK-RAM: Core now receives a fork-owned store identity even though
+    // Phase 01 still delegates behavior to upstream's in-memory implementation.
     //
-    // The Local backend remains available as the compatibility oracle. The RAM
-    // backend should not become "in memory, except for the database we quietly
-    // kept authoritative because it was nearby."
-    Arc::new(shared.with_state_db(None))
+    // That distinction matters: later journal/residency work lands behind this
+    // type instead of changing core's composition seam every time the backend
+    // graduates from another piece of training-wheel infrastructure.
+    Arc::new(RamJournalThreadStore::for_id(id))
 }
 
 #[cfg(test)]

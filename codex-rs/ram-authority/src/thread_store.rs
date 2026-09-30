@@ -420,6 +420,12 @@ impl RamJournalThreadStore {
                         // The data write completed and only the durability fence
                         // failed. Do not append the same turn twice; sync the
                         // already verified bytes and acknowledge that frame.
+                        let recovered_frame = recovered
+                            .frames
+                            .last()
+                            .expect("matching recovered tail was checked above")
+                            .encoded
+                            .clone();
                         let writer = self.journal.clone();
                         tokio::task::spawn_blocking(move || writer.sync_thread(thread_id))
                             .await
@@ -429,6 +435,12 @@ impl RamJournalThreadStore {
                                 ))
                             })?
                             .map_err(internal_error)?;
+
+                        // RESIDENCY-NOTE: Promote the exact verified frame bytes
+                        // recovery read from disk. A sync retry does not get to
+                        // manufacture a second canonical compressed allocation
+                        // merely because serialization is deterministic.
+                        self.resident_histories.push(thread_id, recovered_frame);
 
                         state
                             .pending
@@ -456,6 +468,7 @@ impl RamJournalThreadStore {
         }
 
         let frame_digest = frame.digest;
+        let resident_frame = frame.clone();
         let writer = self.journal.clone();
         let append_result =
             tokio::task::spawn_blocking(move || writer.append_turn_frame(thread_id, &frame))
@@ -476,6 +489,11 @@ impl RamJournalThreadStore {
             state.commit_faulted = true;
             return Err(error);
         }
+
+        // RESIDENCY-NOTE: The exact Arc-backed frame the writer just
+        // acknowledged becomes canonical committed RAM history. There is no
+        // reserialization step and no second compressed payload allocation.
+        self.resident_histories.push(thread_id, resident_frame);
 
         state
             .pending

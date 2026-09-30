@@ -7,6 +7,8 @@ use codex_goal_extension::GoalService;
 use codex_goal_extension::GoalServiceError;
 use codex_goal_extension::GoalSetRequest;
 use codex_goal_extension::GoalTokenBudgetUpdate;
+use codex_core::config::ThreadStoreConfig;
+use codex_state::ThreadGoalStore;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
@@ -25,6 +27,7 @@ pub(crate) struct ThreadGoalRequestProcessor {
     config: Arc<Config>,
     thread_state_manager: ThreadStateManager,
     state_db: Option<StateDbHandle>,
+    goal_store: Option<Arc<dyn ThreadGoalStore>>,
     goal_service: Arc<GoalService>,
     config_manager: ConfigManager,
 }
@@ -36,6 +39,7 @@ impl ThreadGoalRequestProcessor {
         config: Arc<Config>,
         thread_state_manager: ThreadStateManager,
         state_db: Option<StateDbHandle>,
+        goal_store: Option<Arc<dyn ThreadGoalStore>>,
         goal_service: Arc<GoalService>,
         config_manager: ConfigManager,
     ) -> Self {
@@ -45,6 +49,7 @@ impl ThreadGoalRequestProcessor {
             config,
             thread_state_manager,
             state_db,
+            goal_store,
             goal_service,
             config_manager,
         }
@@ -88,19 +93,13 @@ impl ThreadGoalRequestProcessor {
 
     pub(crate) async fn pending_resume_goal_state(
         &self,
-        thread: &CodexThread,
-    ) -> (bool, Option<StateDbHandle>) {
+        _thread: &CodexThread,
+    ) -> (bool, Option<Arc<dyn ThreadGoalStore>>) {
         let emit_thread_goal_update = self.config.features.enabled(Feature::Goals);
-        let thread_goal_state_db = if emit_thread_goal_update {
-            if let Some(state_db) = thread.state_db() {
-                Some(state_db)
-            } else {
-                self.state_db.clone()
-            }
-        } else {
-            None
-        };
-        (emit_thread_goal_update, thread_goal_state_db)
+        let goal_store = emit_thread_goal_update
+            .then(|| self.goal_store.clone())
+            .flatten();
+        (emit_thread_goal_update, goal_store)
     }
 
     pub(crate) async fn restore_inherited_goal_runtime(&self, thread_id: ThreadId) {
@@ -133,16 +132,14 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
-        let state_db = self
-            .state_db_for_materialized_thread(thread_id, GoalAccess::Mutate)
-            .await?;
-        self.reconcile_thread_goal_rollout(thread_id, &state_db)
+        let (goal_store, preview_state_db) = self
+            .prepare_goal_access(thread_id, GoalAccess::Mutate)
             .await?;
         // Active goals can immediately inject an objective or start an idle turn.
         // Stopping a goal must remain possible after managed policy changes.
         let existing_goal = self
             .goal_service
-            .get_thread_goal(&state_db, thread_id)
+            .get_thread_goal(goal_store.as_ref(), thread_id)
             .await
             .map_err(goal_service_error)?;
         let resulting_status = params
@@ -174,7 +171,8 @@ impl ThreadGoalRequestProcessor {
         let outcome = self
             .goal_service
             .set_thread_goal(
-                &state_db,
+                goal_store.as_ref(),
+                preview_state_db.as_deref(),
                 GoalSetRequest {
                     thread_id,
                     objective: objective
@@ -253,12 +251,12 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
-        let state_db = self
-            .state_db_for_materialized_thread(thread_id, GoalAccess::Read)
+        let (goal_store, _preview_state_db) = self
+            .prepare_goal_access(thread_id, GoalAccess::Read)
             .await?;
         let goal = self
             .goal_service
-            .get_thread_goal(&state_db, thread_id)
+            .get_thread_goal(goal_store.as_ref(), thread_id)
             .await
             .map_err(goal_service_error)?
             .map(ThreadGoal::from);
@@ -275,10 +273,8 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
-        let state_db = self
-            .state_db_for_materialized_thread(thread_id, GoalAccess::Mutate)
-            .await?;
-        self.reconcile_thread_goal_rollout(thread_id, &state_db)
+        let (goal_store, _preview_state_db) = self
+            .prepare_goal_access(thread_id, GoalAccess::Mutate)
             .await?;
 
         let listener_command_tx = {
@@ -288,7 +284,7 @@ impl ThreadGoalRequestProcessor {
         };
         let cleared = self
             .goal_service
-            .clear_thread_goal(&state_db, thread_id)
+            .clear_thread_goal(goal_store.as_ref(), thread_id)
             .await
             .map_err(goal_service_error)?;
 
@@ -300,6 +296,45 @@ impl ThreadGoalRequestProcessor {
                 .await;
         }
         Ok(())
+    }
+
+    async fn prepare_goal_access(
+        &self,
+        thread_id: ThreadId,
+        access: GoalAccess,
+    ) -> Result<(Arc<dyn ThreadGoalStore>, Option<StateDbHandle>), JSONRPCErrorError> {
+        let goal_store = self
+            .goal_store
+            .clone()
+            .ok_or_else(|| internal_error("thread goal store unavailable"))?;
+
+        match &self.config.experimental_thread_store {
+            ThreadStoreConfig::Local => {
+                let state_db = self
+                    .state_db_for_materialized_thread(thread_id, access)
+                    .await?;
+                self.reconcile_thread_goal_rollout(thread_id, &state_db)
+                    .await?;
+                Ok((goal_store, Some(state_db)))
+            }
+            ThreadStoreConfig::RamJournal { .. } => {
+                // FORK-RAM: Phase 04 owns hot goal state in RAM. Cold standalone
+                // goal recovery waits for an explicit durable clear/admin record
+                // so an empty fresh map cannot masquerade as recovered history.
+                let thread = self.thread_manager.get_thread(thread_id).await.map_err(|_| {
+                    invalid_request(format!(
+                        "RamJournal goal access requires a loaded thread until administrative goal records are journaled: {thread_id}"
+                    ))
+                })?;
+                if matches!(access, GoalAccess::Mutate) {
+                    ensure_direct_input_allowed(thread.as_ref()).await?;
+                }
+                Ok((goal_store, None))
+            }
+            ThreadStoreConfig::InMemory { .. } => Err(internal_error(
+                "in-memory thread backend does not expose persistent goal state",
+            )),
+        }
     }
 
     async fn state_db_for_materialized_thread(
@@ -419,18 +454,9 @@ impl ThreadGoalRequestProcessor {
     }
 
     pub(crate) async fn emit_thread_goal_snapshot(&self, thread_id: ThreadId) {
-        let state_db = match self
-            .state_db_for_materialized_thread(thread_id, GoalAccess::Read)
-            .await
-        {
-            Ok(state_db) => state_db,
-            Err(err) => {
-                warn!(
-                    "failed to open state db before emitting thread goal resume snapshot for {thread_id}: {}",
-                    err.message
-                );
-                return;
-            }
+        let Some(goal_store) = self.goal_store.clone() else {
+            warn!("goal store unavailable before emitting resume snapshot for {thread_id}");
+            return;
         };
         let listener_command_tx = {
             let thread_state = self.thread_state_manager.thread_state(thread_id).await;
@@ -439,7 +465,7 @@ impl ThreadGoalRequestProcessor {
         };
         if let Some(listener_command_tx) = listener_command_tx {
             let command = crate::thread_state::ThreadListenerCommand::EmitThreadGoalSnapshot {
-                state_db: state_db.clone(),
+                goal_store: Arc::clone(&goal_store),
             };
             if listener_command_tx.send(command).is_ok() {
                 return;
@@ -448,7 +474,12 @@ impl ThreadGoalRequestProcessor {
                 "failed to enqueue thread goal snapshot for {thread_id}: listener command channel is closed"
             );
         }
-        send_thread_goal_snapshot_notification(&self.outgoing, thread_id, &state_db).await;
+        send_thread_goal_snapshot_notification(
+            &self.outgoing,
+            thread_id,
+            goal_store.as_ref(),
+        )
+        .await;
     }
 
     async fn emit_thread_goal_updated_ordered(

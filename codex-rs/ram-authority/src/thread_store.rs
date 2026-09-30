@@ -195,6 +195,12 @@ impl RamJournalThreadStore {
         &self,
         thread_id: ThreadId,
     ) -> ThreadStoreResult<StoredModelContext> {
+        if let Some(context) = self.decoded_contexts.get(thread_id) {
+            // RESIDENCY-NOTE: This is the one retained decoded hot projection.
+            // Canonical history remains the compressed frame set underneath it.
+            return Ok(context);
+        }
+
         let history_mode = self
             .history_modes
             .lock()
@@ -203,45 +209,49 @@ impl RamJournalThreadStore {
             .copied()
             .unwrap_or_default();
 
-        if history_mode == ThreadHistoryMode::Legacy {
+        let context = if history_mode == ThreadHistoryMode::Legacy {
             let history = self.materialize_complete_history(thread_id).await?;
-            return Ok(StoredModelContext {
+            StoredModelContext {
                 thread_id,
                 items: history.items,
-            });
-        }
-
-        let session_meta = self.session_meta_line(thread_id).await?;
-        let mut scan = ModelContextScan::default();
-
-        for item in self.pending_items(thread_id).await.into_iter().rev() {
-            if matches!(scan.push(item), ModelContextScanProgress::Complete) {
-                return Ok(StoredModelContext {
-                    thread_id,
-                    items: scan.finish(session_meta),
-                });
             }
-        }
+        } else {
+            let session_meta = self.session_meta_line(thread_id).await?;
+            let mut scan = ModelContextScan::default();
+            let mut complete = false;
 
-        'frames: for frame in self.resident_histories.frames(thread_id).into_iter().rev() {
-            let (decoded, consumed) =
-                decode_turn_frame(frame.bytes.as_ref()).map_err(internal_error)?;
-            if consumed != frame.bytes.len() {
-                return Err(internal_error(
-                    "resident CJR frame decoder did not consume the complete frame",
-                ));
-            }
-            for item in decoded.items.into_iter().rev() {
+            for item in self.pending_items(thread_id).await.into_iter().rev() {
                 if matches!(scan.push(item), ModelContextScanProgress::Complete) {
-                    break 'frames;
+                    complete = true;
+                    break;
                 }
             }
-        }
 
-        Ok(StoredModelContext {
-            thread_id,
-            items: scan.finish(session_meta),
-        })
+            if !complete {
+                'frames: for frame in self.resident_histories.frames(thread_id).into_iter().rev() {
+                    let (decoded, consumed) =
+                        decode_turn_frame(frame.bytes.as_ref()).map_err(internal_error)?;
+                    if consumed != frame.bytes.len() {
+                        return Err(internal_error(
+                            "resident CJR frame decoder did not consume the complete frame",
+                        ));
+                    }
+                    for item in decoded.items.into_iter().rev() {
+                        if matches!(scan.push(item), ModelContextScanProgress::Complete) {
+                            break 'frames;
+                        }
+                    }
+                }
+            }
+
+            StoredModelContext {
+                thread_id,
+                items: scan.finish(session_meta),
+            }
+        };
+
+        self.decoded_contexts.insert(context.clone());
+        Ok(context)
     }
 
     async fn hydrate_from_journal(&self, thread_id: ThreadId) -> ThreadStoreResult<bool> {

@@ -93,7 +93,7 @@ impl ThreadGoalRequestProcessor {
 
     pub(crate) async fn pending_resume_goal_state(
         &self,
-        thread: &CodexThread,
+        thread_id: ThreadId,
     ) -> (bool, Option<Arc<dyn ThreadGoalStore>>) {
         if !self.config.features.enabled(Feature::Goals) {
             return (false, None);
@@ -112,7 +112,7 @@ impl ThreadGoalRequestProcessor {
             //
             // Never serialize that ambiguity as a durable clear notification.
             let has_resident_goal = goal_store
-                .get_thread_goal(thread.thread_id())
+                .get_thread_goal(thread_id)
                 .await
                 .is_ok_and(|goal| goal.is_some());
             return (has_resident_goal, has_resident_goal.then_some(goal_store));

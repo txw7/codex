@@ -330,7 +330,7 @@ async fn flush_repairs_a_truncated_faulted_terminal_tail_before_retrying() {
     // then append the one canonical frame. Appending after the fragment would
     // technically be more bytes, which is not the same thing as recovery.
     let recovered = std::fs::read(&journal_path).expect("read repaired journal");
-    assert_eq!(recovered, expected.bytes);
+    assert_eq!(recovered.as_slice(), expected.bytes.as_ref());
 }
 
 #[tokio::test]
@@ -372,7 +372,7 @@ async fn flush_syncs_a_complete_unacknowledged_frame_without_appending_it_twice(
         &[terminal.clone()],
     )
     .expect("encode expected frame");
-    std::fs::write(&journal_path, &expected.bytes).expect("materialize complete unacknowledged frame");
+    std::fs::write(&journal_path, expected.bytes.as_ref()).expect("materialize complete unacknowledged frame");
     let before = std::fs::metadata(&journal_path)
         .expect("journal metadata before sync retry")
         .len();
@@ -389,7 +389,7 @@ async fn flush_syncs_a_complete_unacknowledged_frame_without_appending_it_twice(
     );
     assert_eq!(
         std::fs::read(&journal_path).expect("read synced journal"),
-        expected.bytes
+        expected.bytes.as_ref()
     );
 
     ThreadStore::append_items(

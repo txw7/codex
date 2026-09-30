@@ -66,6 +66,19 @@ impl JournalWriter {
         super::journal_thread_path(self.root(), thread_id)
     }
 
+    /// Re-run the durability fence for an already complete journal tail.
+    ///
+    /// JOURNAL-NOTE: A prior append can write the full frame and then fail
+    /// during sync_data(). Recovery may therefore prove that the exact frame is
+    /// already present. In that case retrying the data append would duplicate
+    /// history; sync the existing bytes instead.
+    pub fn sync_thread(&self, thread_id: ThreadId) -> Result<(), JournalWriteError> {
+        let path = self.thread_path(thread_id);
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.sync_data()?;
+        Ok(())
+    }
+
     /// Truncate an incomplete terminal tail to the last verified frame boundary.
     ///
     /// JOURNAL-NOTE: callers may use this only after JournalReader proved the

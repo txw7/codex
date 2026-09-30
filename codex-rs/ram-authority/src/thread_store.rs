@@ -708,19 +708,29 @@ impl ThreadStore for RamJournalThreadStore {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredThreadHistory> {
         Box::pin(async move {
-            match ThreadStore::load_history(self.resident.as_ref(), params.clone()).await {
-                Ok(history) => Ok(history),
-                Err(ThreadStoreError::ThreadNotFound { .. }) => {
-                    if self.hydrate_from_journal(params.thread_id.clone()).await? {
-                        ThreadStore::load_history(self.resident.as_ref(), params).await
-                    } else {
-                        Err(ThreadStoreError::ThreadNotFound {
-                            thread_id: params.thread_id,
-                        })
-                    }
+            if self.resident_histories.frames(params.thread_id).is_empty() {
+                let resident_exists = ThreadStore::read_thread(
+                    self.resident.as_ref(),
+                    ReadThreadParams {
+                        thread_id: params.thread_id,
+                        include_archived: params.include_archived,
+                        include_history: false,
+                    },
+                )
+                .await
+                .is_ok();
+
+                if !resident_exists && !self.hydrate_from_journal(params.thread_id).await? {
+                    return Err(ThreadStoreError::ThreadNotFound {
+                        thread_id: params.thread_id,
+                    });
                 }
-                Err(error) => Err(error),
             }
+
+            // RESIDENCY-NOTE: Complete-history APIs may explicitly materialize
+            // decoded RolloutItems, but the resulting Vec is a response value,
+            // not canonical resident state. Compressed frames remain authority.
+            self.materialize_complete_history(params.thread_id).await
         })
     }
 
@@ -729,38 +739,63 @@ impl ThreadStore for RamJournalThreadStore {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
         Box::pin(async move {
-            match ThreadStore::load_latest_model_context(self.resident.as_ref(), params.clone()).await
-            {
-                Ok(context) => Ok(context),
-                Err(ThreadStoreError::ThreadNotFound { .. }) => {
-                    if self.hydrate_from_journal(params.thread_id.clone()).await? {
-                        ThreadStore::load_latest_model_context(self.resident.as_ref(), params).await
-                    } else {
-                        Err(ThreadStoreError::ThreadNotFound {
-                            thread_id: params.thread_id,
-                        })
-                    }
-                }
-                Err(error) => Err(error),
+            let resident_exists = ThreadStore::read_thread(
+                self.resident.as_ref(),
+                ReadThreadParams {
+                    thread_id: params.thread_id,
+                    include_archived: params.include_archived,
+                    include_history: false,
+                },
+            )
+            .await
+            .is_ok();
+
+            if !resident_exists && !self.hydrate_from_journal(params.thread_id).await? {
+                return Err(ThreadStoreError::ThreadNotFound {
+                    thread_id: params.thread_id,
+                });
             }
+
+            // RESIDENCY-NOTE: Paginated context scans walk pending hot items and
+            // compressed frames from newest to oldest. They stop when upstream's
+            // ModelContextScan says enough context exists instead of decoding
+            // the historical museum because somebody asked for the current room.
+            self.materialize_latest_model_context(params.thread_id).await
         })
     }
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
         Box::pin(async move {
-            match ThreadStore::read_thread(self.resident.as_ref(), params.clone()).await {
-                Ok(thread) => Ok(thread),
+            let metadata_params = ReadThreadParams {
+                thread_id: params.thread_id,
+                include_archived: params.include_archived,
+                include_history: false,
+            };
+
+            let mut thread = match ThreadStore::read_thread(
+                self.resident.as_ref(),
+                metadata_params.clone(),
+            )
+            .await
+            {
+                Ok(thread) => thread,
                 Err(ThreadStoreError::ThreadNotFound { .. }) => {
-                    if self.hydrate_from_journal(params.thread_id.clone()).await? {
-                        ThreadStore::read_thread(self.resident.as_ref(), params).await
-                    } else {
-                        Err(ThreadStoreError::ThreadNotFound {
+                    if !self.hydrate_from_journal(params.thread_id).await? {
+                        return Err(ThreadStoreError::ThreadNotFound {
                             thread_id: params.thread_id,
-                        })
+                        });
                     }
+                    ThreadStore::read_thread(self.resident.as_ref(), metadata_params).await?
                 }
-                Err(error) => Err(error),
+                Err(error) => return Err(error),
+            };
+
+            if params.include_history {
+                thread.history =
+                    Some(self.materialize_complete_history(params.thread_id).await?);
             }
+
+            Ok(thread)
         })
     }
 

@@ -47,6 +47,7 @@ use crate::StoredThreadHistory;
 use crate::StoredThreadSection;
 use crate::StoredThreadSectionsPage;
 use crate::ThreadAttachmentPage;
+use crate::ThreadAuthorityRefV1;
 use crate::ThreadMetadataPatch;
 use crate::ThreadOccurrenceSearchPage;
 use crate::ThreadPage;
@@ -100,6 +101,15 @@ pub trait ThreadStore: Any + Send + Sync {
     /// already paginated should override this instead of relying on core to infer storage behavior.
     fn default_history_mode(&self) -> ThreadHistoryMode {
         ThreadHistoryMode::Legacy
+    }
+
+    /// Returns the current storage-side authority for a logical thread.
+    ///
+    /// Upstream backends that do not expose explicit authority retain the
+    /// default. Hosts must not synthesize authority from thread_id when this is
+    /// absent; "we can probably resume it somewhere" is not a capability.
+    fn thread_authority(&self, _thread_id: ThreadId) -> Option<ThreadAuthorityRefV1> {
+        None
     }
 
     /// Whether terminal turn delivery must be withheld until this store reports

@@ -109,6 +109,13 @@ impl RamJournalThreadStore {
             .clone()
     }
 
+    fn has_ram_journal_authority(&self, thread_id: ThreadId) -> bool {
+        self.bootstrap_params
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&thread_id)
+    }
+
     async fn session_meta_line(&self, thread_id: ThreadId) -> ThreadStoreResult<SessionMetaLine> {
         let context = ThreadStore::load_latest_model_context(
             self.resident.as_ref(),
@@ -738,6 +745,14 @@ impl ThreadStore for RamJournalThreadStore {
                 }
             }
 
+            if !self.has_ram_journal_authority(params.thread_id) {
+                // COMPAT-NOTE: A caller-supplied legacy/external resume can
+                // temporarily live only in the delegate until migration owns
+                // that history. Do not call an empty compressed frame set
+                // "authority" merely because we would prefer it aesthetically.
+                return ThreadStore::load_history(self.resident.as_ref(), params).await;
+            }
+
             // RESIDENCY-NOTE: Complete-history APIs may explicitly materialize
             // decoded RolloutItems, but the resulting Vec is a response value,
             // not canonical resident state. Compressed frames remain authority.
@@ -765,6 +780,10 @@ impl ThreadStore for RamJournalThreadStore {
                 return Err(ThreadStoreError::ThreadNotFound {
                     thread_id: params.thread_id,
                 });
+            }
+
+            if !self.has_ram_journal_authority(params.thread_id) {
+                return ThreadStore::load_latest_model_context(self.resident.as_ref(), params).await;
             }
 
             // RESIDENCY-NOTE: Paginated context scans walk pending hot items and
@@ -802,8 +821,14 @@ impl ThreadStore for RamJournalThreadStore {
             };
 
             if params.include_history {
-                thread.history =
-                    Some(self.materialize_complete_history(params.thread_id).await?);
+                if self.has_ram_journal_authority(params.thread_id) {
+                    thread.history =
+                        Some(self.materialize_complete_history(params.thread_id).await?);
+                } else {
+                    // COMPAT-NOTE: no CJR bootstrap means the delegate is still
+                    // the only canonical source for this compatibility thread.
+                    return ThreadStore::read_thread(self.resident.as_ref(), params).await;
+                }
             }
 
             Ok(thread)

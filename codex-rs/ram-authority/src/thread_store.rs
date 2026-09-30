@@ -875,6 +875,14 @@ impl ThreadStore for RamJournalThreadStore {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredThreadHistory> {
         Box::pin(async move {
+            if self.is_unloaded(params.thread_id)
+                && !self.hydrate_from_journal(params.thread_id).await?
+            {
+                return Err(ThreadStoreError::ThreadNotFound {
+                    thread_id: params.thread_id,
+                });
+            }
+
             if self.resident_histories.frames(params.thread_id).is_empty() {
                 let resident_exists = ThreadStore::read_thread(
                     self.resident.as_ref(),
@@ -914,6 +922,14 @@ impl ThreadStore for RamJournalThreadStore {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
         Box::pin(async move {
+            if self.is_unloaded(params.thread_id)
+                && !self.hydrate_from_journal(params.thread_id).await?
+            {
+                return Err(ThreadStoreError::ThreadNotFound {
+                    thread_id: params.thread_id,
+                });
+            }
+
             let resident_exists = ThreadStore::read_thread(
                 self.resident.as_ref(),
                 ReadThreadParams {
@@ -945,6 +961,14 @@ impl ThreadStore for RamJournalThreadStore {
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
         Box::pin(async move {
+            if self.is_unloaded(params.thread_id)
+                && !self.hydrate_from_journal(params.thread_id).await?
+            {
+                return Err(ThreadStoreError::ThreadNotFound {
+                    thread_id: params.thread_id,
+                });
+            }
+
             let metadata_params = ReadThreadParams {
                 thread_id: params.thread_id,
                 include_archived: params.include_archived,

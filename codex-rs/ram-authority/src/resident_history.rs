@@ -111,6 +111,14 @@ impl ResidentHistories {
         })
     }
 
+    pub fn last_digest(&self, thread_id: ThreadId) -> Option<[u8; 32]> {
+        self.with(thread_id, |history| {
+            history
+                .and_then(ResidentHistory::last)
+                .map(|frame| frame.digest)
+        })
+    }
+
     pub fn remove(&self, thread_id: ThreadId) -> Option<ResidentHistory> {
         self.threads
             .lock()

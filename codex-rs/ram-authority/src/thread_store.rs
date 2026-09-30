@@ -324,6 +324,8 @@ impl RamJournalThreadStore {
                 .map(|frame| frame.encoded.clone()),
         );
 
+        self.decoded_contexts.invalidate(thread_id);
+
         // RESIDENCY-NOTE: Do not expand recovered committed history into the
         // upstream delegate. create_thread() already installs SessionMeta there;
         // the verified CJR frames above are the canonical committed transcript.
@@ -576,6 +578,7 @@ impl ThreadStore for RamJournalThreadStore {
         let history_mode = params.history_mode;
         let bootstrap = params.clone();
         Box::pin(async move {
+            self.decoded_contexts.invalidate(thread_id);
             ThreadStore::create_thread(self.resident.as_ref(), params).await?;
             self.history_modes
                 .lock()
@@ -598,6 +601,7 @@ impl ThreadStore for RamJournalThreadStore {
             .unwrap_or_default();
 
         Box::pin(async move {
+            self.decoded_contexts.invalidate(thread_id);
             let already_compressed = self.resident_histories.with(thread_id, |history| {
                 history.is_some_and(|history| !history.frames().is_empty())
             });
@@ -693,6 +697,13 @@ impl ThreadStore for RamJournalThreadStore {
                         sealed.turn_id
                     ),
                 });
+            }
+
+            if !persisted_items.is_empty() {
+                // RESIDENCY-NOTE: Invalidate only when canonical model-visible
+                // state actually changes. Duplicate terminal acknowledgement
+                // paths returned above and do not churn the hot projection.
+                self.decoded_contexts.invalidate(thread_id);
             }
 
             // FORK-INVARIANT: Canonical session transcript no longer enters

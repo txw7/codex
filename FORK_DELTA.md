@@ -114,3 +114,25 @@ Explicitly **not** claimed yet:
 - local Cargo checks and focused Rust tests still need to be executed outside this GitHub-only editing surface.
 
 The final bullet is deliberately boring and therefore important. A test existing in source is not the same thing as a test having run. This fork is already opinionated enough without becoming metaphysical about CI receipts.
+
+
+### RAM-TS-005
+
+Upstream symbols:
+- `codex_thread_store::ThreadStore::requires_terminal_durability_before_delivery`
+- `codex_thread_store::LiveThread::requires_terminal_durability_before_delivery`
+- `Session::send_event_raw_with_persistence`
+
+Fork behavior: RamJournal opts into terminal-delivery gating. If terminal persistence fails, Session retries the sealed durability fence and requires an idempotent acknowledgement before delivering `TurnComplete` or `TurnAborted`.
+
+Reason: in RamJournal, a terminal event is also the durability receipt. Announcing completion after the journal rejected the turn violates the storage contract even if upstream Local storage prefers a more permissive failure policy.
+
+Merge rule: if upstream changes event persistence/delivery ordering, re-audit this gate before resolving the merge. Do not replace it with a RamJournal concrete-type check; capability belongs to the storage boundary.
+
+Tests/receipts:
+- faulted sealed commit remains retryable in RAM;
+- truncated tail is repaired before retry append;
+- complete unacknowledged frame is synced rather than duplicated;
+- Local/InMemory retain the default non-strict policy.
+
+Snark note: "completed, except the part where persistence failed" is not a useful terminal state.

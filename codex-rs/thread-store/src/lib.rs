@@ -4,6 +4,7 @@
 //! Implementations are responsible for resolving that id to local rollout files, RPC requests, or
 //! any other backing store.
 
+mod authority;
 mod error;
 mod in_memory;
 mod live_thread;
@@ -24,6 +25,9 @@ pub use codex_state::QueuedUserSubmissionRecord;
 pub use codex_state::RemoveThreadAttachmentOutcome;
 pub use codex_state::ThreadAttachment;
 pub use codex_state::ThreadAttachmentPage;
+pub use authority::ThreadAuthorityBindingV1;
+pub use authority::ThreadAuthorityCapability;
+pub use authority::ThreadAuthorityRefV1;
 pub use error::ThreadStoreError;
 pub use error::ThreadStoreResult;
 pub use in_memory::InMemoryThreadStore;

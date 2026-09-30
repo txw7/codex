@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::sync::Arc;
 
 use codex_protocol::ThreadId;
 use codex_rollout::RolloutItem;
@@ -51,9 +52,13 @@ impl JournalFormatError {
 /// The writer is not allowed to serialize, append sidecars, or discover more
 /// metadata after this point. One immutable frame is how "one turn, one append"
 /// remains an invariant instead of a slogan.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EncodedTurnFrame {
-    pub bytes: Vec<u8>,
+    pub thread_id: ThreadId,
+    pub turn_id: String,
+    pub sequence: u64,
+    pub previous_digest: Option<[u8; 32]>,
+    pub bytes: Arc<[u8]>,
     pub digest: [u8; 32],
     pub compressed_len: u64,
     pub uncompressed_len: u64,
@@ -100,7 +105,11 @@ pub fn encode_turn_frame(
     bytes.extend_from_slice(FRAME_END_MAGIC);
 
     Ok(EncodedTurnFrame {
-        bytes,
+        thread_id,
+        turn_id: turn_id.to_string(),
+        sequence,
+        previous_digest,
+        bytes: Arc::from(bytes),
         digest,
         compressed_len,
         uncompressed_len,
@@ -118,6 +127,8 @@ pub struct DecodedTurnFrame {
     pub bootstrap: Option<CreateThreadParams>,
     pub items: Vec<RolloutItem>,
     pub digest: [u8; 32],
+    pub compressed_len: u64,
+    pub uncompressed_len: u64,
 }
 
 /// Decode exactly one CJR V1 frame from the beginning of `bytes`.
@@ -246,6 +257,8 @@ pub fn decode_turn_frame(
             bootstrap,
             items,
             digest: declared_digest,
+            compressed_len,
+            uncompressed_len,
         },
         frame_end,
     ))
@@ -266,7 +279,7 @@ mod tests {
 
         // JOURNAL-NOTE: deterministic bytes make duplicate-commit detection a
         // content check rather than an interpretive exercise involving clocks.
-        assert_eq!(first.bytes, second.bytes);
+        assert_eq!(first.bytes.as_ref(), second.bytes.as_ref());
         assert_eq!(first.digest, second.digest);
     }
 

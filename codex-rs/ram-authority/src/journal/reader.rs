@@ -264,6 +264,7 @@ pub fn recover_bytes(
             turn_id: frame.turn_id.clone(),
             sequence: frame.sequence,
             previous_digest: frame.previous_digest,
+            has_checkpoint: frame.checkpoint.is_some(),
             bytes: Arc::from(bytes[offset..offset + consumed].to_vec()),
             digest: frame.digest,
             compressed_len: frame.compressed_len,

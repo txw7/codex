@@ -12,6 +12,7 @@ pub use format::EncodedTurnFrame;
 pub use format::JournalFormatError;
 pub use format::decode_turn_frame;
 pub use format::encode_turn_frame;
+pub use format::encode_turn_frame_with_checkpoint;
 pub use reader::JournalReadError;
 pub use reader::JournalReader;
 pub use reader::RecoveredFrame;

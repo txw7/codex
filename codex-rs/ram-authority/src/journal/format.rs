@@ -4,6 +4,7 @@ use std::sync::Arc;
 use codex_protocol::ThreadId;
 use codex_rollout::RolloutItem;
 use codex_thread_store::CreateThreadParams;
+use codex_thread_store::StoredModelContext;
 
 const FRAME_MAGIC: &[u8; 8] = b"CJR1TURN";
 const FRAME_END_MAGIC: &[u8; 8] = b"CJR1END!";
@@ -58,6 +59,7 @@ pub struct EncodedTurnFrame {
     pub turn_id: String,
     pub sequence: u64,
     pub previous_digest: Option<[u8; 32]>,
+    pub has_checkpoint: bool,
     pub bytes: Arc<[u8]>,
     pub digest: [u8; 32],
     pub compressed_len: u64,
@@ -78,7 +80,27 @@ pub fn encode_turn_frame(
     bootstrap: Option<&CreateThreadParams>,
     items: &[RolloutItem],
 ) -> Result<EncodedTurnFrame, JournalFormatError> {
-    let payload = serde_json::to_vec(&serde_json::json!({
+    encode_turn_frame_with_checkpoint(
+        thread_id,
+        turn_id,
+        sequence,
+        previous_digest,
+        bootstrap,
+        None,
+        items,
+    )
+}
+
+pub fn encode_turn_frame_with_checkpoint(
+    thread_id: ThreadId,
+    turn_id: &str,
+    sequence: u64,
+    previous_digest: Option<[u8; 32]>,
+    bootstrap: Option<&CreateThreadParams>,
+    checkpoint: Option<&StoredModelContext>,
+    items: &[RolloutItem],
+) -> Result<EncodedTurnFrame, JournalFormatError> {
+    let mut payload_value = serde_json::json!({
         "schema": "codex.ram_journal.turn.v1",
         "thread_id": thread_id.to_string(),
         "turn_id": turn_id,
@@ -86,7 +108,19 @@ pub fn encode_turn_frame(
         "previous_digest": previous_digest,
         "bootstrap": bootstrap,
         "items": items,
-    }))?;
+    });
+    if let Some(checkpoint) = checkpoint {
+        // JOURNAL-NOTE: Omit the field entirely when absent so ordinary turn
+        // bytes remain compatible with pre-checkpoint CJR V1 frames.
+        payload_value
+            .as_object_mut()
+            .expect("turn payload is an object")
+            .insert(
+                "checkpoint".to_string(),
+                serde_json::to_value(checkpoint)?,
+            );
+    }
+    let payload = serde_json::to_vec(&payload_value)?;
     let compressed = zstd::stream::encode_all(Cursor::new(&payload), 1)?;
     let digest = *blake3::hash(&compressed).as_bytes();
 
@@ -109,6 +143,7 @@ pub fn encode_turn_frame(
         turn_id: turn_id.to_string(),
         sequence,
         previous_digest,
+        has_checkpoint: checkpoint.is_some(),
         bytes: Arc::from(bytes),
         digest,
         compressed_len,
@@ -125,6 +160,7 @@ pub struct DecodedTurnFrame {
     pub sequence: u64,
     pub previous_digest: Option<[u8; 32]>,
     pub bootstrap: Option<CreateThreadParams>,
+    pub checkpoint: Option<StoredModelContext>,
     pub items: Vec<RolloutItem>,
     pub digest: [u8; 32],
     pub compressed_len: u64,
@@ -241,6 +277,12 @@ pub fn decode_turn_frame(
             .cloned()
             .unwrap_or(serde_json::Value::Null),
     )?;
+    let checkpoint = serde_json::from_value(
+        value
+            .get("checkpoint")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )?;
     let items = serde_json::from_value(
         value
             .get("items")
@@ -255,6 +297,7 @@ pub fn decode_turn_frame(
             sequence,
             previous_digest,
             bootstrap,
+            checkpoint,
             items,
             digest: declared_digest,
             compressed_len,
@@ -308,6 +351,48 @@ mod tests {
         assert_eq!(decoded.digest, frame.digest);
         assert!(decoded.bootstrap.is_none());
         assert!(decoded.items.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_round_trips_without_changing_noncheckpoint_frame_bytes() {
+        let thread_id = ThreadId::new();
+        let ordinary =
+            encode_turn_frame(thread_id, "turn-cp", 1, None, None, &[])
+                .expect("ordinary frame");
+        let ordinary_via_extended = encode_turn_frame_with_checkpoint(
+            thread_id,
+            "turn-cp",
+            1,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("ordinary extended frame");
+        assert_eq!(ordinary.bytes.as_ref(), ordinary_via_extended.bytes.as_ref());
+
+        let checkpoint = StoredModelContext {
+            thread_id,
+            items: Vec::new(),
+        };
+        let checkpointed = encode_turn_frame_with_checkpoint(
+            thread_id,
+            "turn-cp",
+            1,
+            None,
+            None,
+            Some(&checkpoint),
+            &[],
+        )
+        .expect("checkpointed frame");
+        let (decoded, _) =
+            decode_turn_frame(checkpointed.bytes.as_ref()).expect("decode checkpointed frame");
+
+        assert!(checkpointed.has_checkpoint);
+        assert_eq!(
+            decoded.checkpoint.expect("checkpoint should round trip").thread_id,
+            thread_id
+        );
     }
 
     #[test]

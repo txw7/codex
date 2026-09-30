@@ -1027,6 +1027,19 @@ impl ThreadStore for RamJournalThreadStore {
                         "refusing to unload thread {thread_id} with an unresolved journal fault"
                     )));
                 }
+
+                let resident_head = self.resident_histories.last_digest(thread_id);
+                if resident_head.is_some() && resident_head != state.last_digest {
+                    // FORK-INVARIANT: eviction is legal only when the complete
+                    // resident committed head is exactly the durable journal
+                    // head we last acknowledged.
+                    //
+                    // "Same number of turns, probably" is not an equivalence
+                    // witness. Digests are cheaper than future archaeology.
+                    return Err(internal_error(format!(
+                        "refusing to unload thread {thread_id}: resident head does not match durable head"
+                    )));
+                }
             }
 
             ThreadStore::shutdown_thread(self.resident.as_ref(), thread_id).await?;

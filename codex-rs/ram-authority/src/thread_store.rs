@@ -208,6 +208,15 @@ impl ThreadStore for RamJournalThreadStore {
         self
     }
 
+    fn requires_terminal_durability_before_delivery(&self) -> bool {
+        // FORK-INVARIANT: RamJournal terminal events are durability receipts.
+        //
+        // If the frame did not commit, the client does not get to hear
+        // "completed" merely because upstream's generic failure policy is more
+        // optimistic than this backend contract.
+        true
+    }
+
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
         let thread_id = params.thread_id.clone();
         let history_mode = params.history_mode;

@@ -35,6 +35,7 @@ use codex_thread_store::ThreadStoreResult;
 use codex_thread_store::UpdateThreadMetadataParams;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::decoded_context_cache::DecodedContextCache;
 use crate::journal::JournalReader;
 use crate::journal::JournalWriter;
 use crate::journal::decode_turn_frame;
@@ -42,6 +43,11 @@ use crate::journal::encode_turn_frame;
 use crate::pending_turn::PendingTurn;
 use crate::pending_turn::terminal_event_identity;
 use crate::resident_history::ResidentHistories;
+
+// RESIDENCY-NOTE: This is a provisional fork default, not sacred geometry.
+// The cache is byte-bounded today; Phase 03/06 telemetry and deployment config
+// can tune the number without changing the authority model.
+const DEFAULT_DECODED_CONTEXT_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug)]
 struct ThreadJournalState {
@@ -83,10 +89,23 @@ pub struct RamJournalThreadStore {
     history_modes: Mutex<HashMap<ThreadId, ThreadHistoryMode>>,
     bootstrap_params: Mutex<HashMap<ThreadId, CreateThreadParams>>,
     resident_histories: ResidentHistories,
+    decoded_contexts: DecodedContextCache,
 }
 
 impl RamJournalThreadStore {
     pub fn new(id: &str, journal_root: PathBuf) -> Self {
+        Self::new_with_decoded_context_budget(
+            id,
+            journal_root,
+            DEFAULT_DECODED_CONTEXT_CACHE_BYTES,
+        )
+    }
+
+    pub fn new_with_decoded_context_budget(
+        id: &str,
+        journal_root: PathBuf,
+        decoded_context_budget_bytes: usize,
+    ) -> Self {
         Self {
             resident: InMemoryThreadStore::for_id(id),
             journal: JournalWriter::new(journal_root.clone()),
@@ -95,6 +114,7 @@ impl RamJournalThreadStore {
             history_modes: Mutex::new(HashMap::new()),
             bootstrap_params: Mutex::new(HashMap::new()),
             resident_histories: ResidentHistories::default(),
+            decoded_contexts: DecodedContextCache::new(decoded_context_budget_bytes),
         }
     }
 

@@ -306,6 +306,8 @@ impl MessageProcessor {
         // advent calendar.
         let queue_store =
             codex_core::queue_store_from_config(config.as_ref(), state_db.as_ref());
+        let goal_store =
+            codex_core::goal_store_from_config(config.as_ref(), state_db.as_ref());
         let environment_manager_for_requests = Arc::clone(&environment_manager);
         let environment_manager_for_extensions = Arc::clone(&environment_manager);
         let restriction_product = session_source.restriction_product();
@@ -340,6 +342,7 @@ impl MessageProcessor {
                     event_sink: Arc::clone(&extension_event_sink),
                     auth_manager: auth_manager.clone(),
                     state_db: state_db.clone(),
+                    goal_store: goal_store.clone(),
                     analytics_events_client: analytics_events_client.clone(),
                     thread_manager: thread_manager.clone(),
                     goal_service: Arc::clone(&goal_service),

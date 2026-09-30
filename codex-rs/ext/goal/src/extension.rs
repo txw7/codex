@@ -58,7 +58,8 @@ pub struct GoalExtensionConfig {
 
 #[derive(Clone)]
 pub struct GoalExtension<C> {
-    state_dbs: Arc<codex_state::StateRuntime>,
+    goal_store: Arc<dyn codex_state::ThreadGoalStore>,
+    preview_state_db: Option<Arc<codex_state::StateRuntime>>,
     analytics: GoalAnalytics,
     event_emitter: GoalEventEmitter,
     metrics: GoalMetrics,
@@ -75,7 +76,8 @@ impl<C> std::fmt::Debug for GoalExtension<C> {
 
 impl<C> GoalExtension<C> {
     pub(crate) fn new_with_host_capabilities(
-        state_dbs: Arc<codex_state::StateRuntime>,
+        goal_store: Arc<dyn codex_state::ThreadGoalStore>,
+        preview_state_db: Option<Arc<codex_state::StateRuntime>>,
         analytics_events_client: AnalyticsEventsClient,
         event_sink: Arc<dyn ExtensionEventSink>,
         metrics_client: Option<MetricsClient>,
@@ -84,7 +86,8 @@ impl<C> GoalExtension<C> {
         goal_config: impl Fn(&C) -> GoalExtensionConfig + Send + Sync + 'static,
     ) -> Self {
         Self {
-            state_dbs,
+            goal_store,
+            preview_state_db,
             analytics: GoalAnalytics::new(analytics_events_client),
             event_emitter: GoalEventEmitter::new(event_sink),
             metrics: GoalMetrics::new(metrics_client),
@@ -143,7 +146,7 @@ where
             let runtime = input.thread_store.get_or_init::<GoalRuntimeHandle>(|| {
                 GoalRuntimeHandle::new(
                     thread_id,
-                    Arc::clone(&self.state_dbs),
+                    Arc::clone(&self.goal_store),
                     self.event_emitter.clone(),
                     self.metrics.clone(),
                     self.thread_manager.clone(),
@@ -240,8 +243,7 @@ where
             };
 
             if let Err(err) = self
-                .state_dbs
-                .thread_goals()
+                .goal_store
                 .clear_thread_goal_continuation_deferral(runtime.thread_id())
                 .await
             {
@@ -262,8 +264,7 @@ where
                 return;
             }
             let Ok(goal) = self
-                .state_dbs
-                .thread_goals()
+                .goal_store
                 .get_thread_goal(runtime.thread_id())
                 .await
             else {
@@ -550,7 +551,7 @@ where
         let tools = [
             GoalToolExecutor::get(
                 runtime.thread_id(),
-                Arc::clone(&self.state_dbs),
+                Arc::clone(&self.goal_store),
                 runtime.accounting_state(),
                 self.analytics.clone(),
                 self.event_emitter.clone(),
@@ -558,7 +559,8 @@ where
             ),
             GoalToolExecutor::create(
                 runtime.thread_id(),
-                Arc::clone(&self.state_dbs),
+                Arc::clone(&self.goal_store),
+                self.preview_state_db.clone(),
                 runtime.accounting_state(),
                 self.analytics.clone(),
                 self.event_emitter.clone(),
@@ -567,7 +569,7 @@ where
             ),
             GoalToolExecutor::update(
                 runtime.thread_id(),
-                Arc::clone(&self.state_dbs),
+                Arc::clone(&self.goal_store),
                 runtime.accounting_state(),
                 self.analytics.clone(),
                 self.event_emitter.clone(),
@@ -586,7 +588,8 @@ where
 
 pub fn install_with_backend<C>(
     registry: &mut ExtensionRegistryBuilder<C>,
-    state_dbs: Arc<codex_state::StateRuntime>,
+    goal_store: Arc<dyn codex_state::ThreadGoalStore>,
+    preview_state_db: Option<Arc<codex_state::StateRuntime>>,
     analytics_events_client: AnalyticsEventsClient,
     metrics_client: Option<MetricsClient>,
     thread_manager: Weak<ThreadManager>,
@@ -596,7 +599,8 @@ pub fn install_with_backend<C>(
     C: Send + Sync + 'static,
 {
     let extension = Arc::new(GoalExtension::new_with_host_capabilities(
-        state_dbs,
+        goal_store,
+        preview_state_db,
         analytics_events_client,
         registry.event_sink(),
         metrics_client,

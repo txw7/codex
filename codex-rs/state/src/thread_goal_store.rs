@@ -29,10 +29,10 @@ pub trait ThreadGoalStore: Send + Sync {
         thread_id: ThreadId,
     ) -> ThreadGoalStoreFuture<'_, Option<ThreadGoal>>;
 
-    fn replace_thread_goal_snapshot(
-        &self,
-        goal: &ThreadGoal,
-    ) -> ThreadGoalStoreFuture<'_, ()>;
+    fn replace_thread_goal_snapshot<'a>(
+        &'a self,
+        goal: &'a ThreadGoal,
+    ) -> ThreadGoalStoreFuture<'a, ()>;
 
     fn has_thread_goal_continuation_deferral(
         &self,
@@ -44,21 +44,21 @@ pub trait ThreadGoalStore: Send + Sync {
         thread_id: ThreadId,
     ) -> ThreadGoalStoreFuture<'_, ()>;
 
-    fn replace_thread_goal(
-        &self,
+    fn replace_thread_goal<'a>(
+        &'a self,
         thread_id: ThreadId,
-        objective: &str,
+        objective: &'a str,
         status: ThreadGoalStatus,
         token_budget: Option<i64>,
-    ) -> ThreadGoalStoreFuture<'_, ThreadGoal>;
+    ) -> ThreadGoalStoreFuture<'a, ThreadGoal>;
 
-    fn insert_thread_goal(
-        &self,
+    fn insert_thread_goal<'a>(
+        &'a self,
         thread_id: ThreadId,
-        objective: &str,
+        objective: &'a str,
         status: ThreadGoalStatus,
         token_budget: Option<i64>,
-    ) -> ThreadGoalStoreFuture<'_, Option<ThreadGoal>>;
+    ) -> ThreadGoalStoreFuture<'a, Option<ThreadGoal>>;
 
     fn update_thread_goal(
         &self,

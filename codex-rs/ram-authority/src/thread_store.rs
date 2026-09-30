@@ -287,18 +287,12 @@ impl RamJournalThreadStore {
                 .map(|frame| frame.encoded.clone()),
         );
 
-        let recovered_items = recovered.items().map_err(internal_error)?;
-        if !recovered_items.is_empty() {
-            ThreadStore::append_items(
-                self.resident.as_ref(),
-                AppendThreadItemsParams {
-                    thread_id: thread_id.clone(),
-                    items: recovered_items,
-                },
-            )
-            .await?;
-        }
-
+        // RESIDENCY-NOTE: Do not expand recovered committed history into the
+        // upstream delegate. create_thread() already installs SessionMeta there;
+        // the verified CJR frames above are the canonical committed transcript.
+        //
+        // Cold load is allowed to validate history. It does not need to unpack
+        // the entire moving truck into a second resident object graph.
         self.history_modes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

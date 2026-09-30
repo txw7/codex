@@ -88,6 +88,26 @@ impl ThreadGoalRequestProcessor {
         if !self.config.features.enabled(Feature::Goals) {
             return;
         }
+
+        if matches!(
+            &self.config.experimental_thread_store,
+            ThreadStoreConfig::RamJournal { .. }
+        ) {
+            let has_resident_goal = match self.goal_store.as_ref() {
+                Some(goal_store) => goal_store
+                    .get_thread_goal(thread_id)
+                    .await
+                    .is_ok_and(|goal| goal.is_some()),
+                None => false,
+            };
+            if !has_resident_goal {
+                // COMPAT-NOTE: no canonical clear record exists yet. Silence is
+                // honest here; emitting "cleared" would turn missing recovery
+                // evidence into a state transition.
+                return;
+            }
+        }
+
         self.emit_thread_goal_snapshot(thread_id).await;
     }
 

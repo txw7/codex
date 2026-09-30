@@ -1202,26 +1202,29 @@ impl ThreadStore for RamJournalThreadStore {
 
     fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage> {
         Box::pin(async move {
-            let reader = self.reader.clone();
-            let durable_ids = tokio::task::spawn_blocking(move || reader.list_thread_ids())
-                .await
-                .map_err(|error| {
-                    internal_error(format!("journal discovery task failed: {error}"))
-                })?
-                .map_err(internal_error)?;
+            if self.catalog.needs_discovery() {
+                let reader = self.reader.clone();
+                let durable_ids = tokio::task::spawn_blocking(move || reader.list_thread_ids())
+                    .await
+                    .map_err(|error| {
+                        internal_error(format!("journal discovery task failed: {error}"))
+                    })?
+                    .map_err(internal_error)?;
 
-            // RESIDENCY-NOTE: Phase 02 eagerly hydrates every cold durable thread
-            // before delegating list/filter/page semantics to the resident store.
-            //
-            // This is deliberately correct and deliberately expensive. Phase 03
-            // replaces it with a resident metadata catalog. Do not "optimize"
-            // this temporary path into a clever partial disk cache and then
-            // accidentally preserve the wrong architecture forever.
-            for thread_id in durable_ids {
+                // RESIDENCY-NOTE: Cold discovery is paid once per process.
+                //
+                // The catalog is a rebuildable projection, so a restart may
+                // scan journal placement again. Ordinary thread/list calls in
+                // the same process do not get to repeatedly interrogate disk
+                // about facts we already retained in RAM.
+                self.catalog.install_discovery(durable_ids);
+            }
+
+            for thread_id in self.catalog.thread_ids() {
                 match ThreadStore::read_thread(
                     self.resident.as_ref(),
                     ReadThreadParams {
-                        thread_id: thread_id.clone(),
+                        thread_id,
                         include_archived: true,
                         include_history: false,
                     },

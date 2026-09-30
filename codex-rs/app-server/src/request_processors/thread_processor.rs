@@ -4470,7 +4470,7 @@ impl ThreadRequestProcessor {
 
             let (emit_thread_goal_update, thread_goal_store) = self
                 .thread_goal_processor
-                .pending_resume_goal_state(existing_thread.as_ref())
+                .pending_resume_goal_state(existing_thread_id)
                 .await;
             let paginated_turns = if paginated_resume && include_turns {
                 Some(self.paginated_thread_full_turns(existing_thread_id).await?)

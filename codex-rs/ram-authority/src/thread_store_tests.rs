@@ -278,3 +278,136 @@ async fn thread_list_discovers_a_cold_durable_journal_without_knowing_its_id() {
     // listing does not deserialize an entire conversation just to draw a row.
     assert!(page.items.iter().any(|thread| thread.thread_id == thread_id));
 }
+
+
+#[tokio::test]
+async fn flush_repairs_a_truncated_faulted_terminal_tail_before_retrying() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().to_path_buf();
+    let thread_id = ThreadId::new();
+    let params = create_thread_params(thread_id);
+    let terminal = terminal_turn("turn-truncated-retry");
+    let journal_path = crate::journal::journal_thread_path(&root, thread_id);
+
+    let store = RamJournalThreadStore::new("truncated-retry", root.clone());
+    ThreadStore::create_thread(&store, params.clone())
+        .await
+        .expect("create resident thread");
+
+    std::fs::create_dir_all(journal_path.parent().expect("journal parent"))
+        .expect("create journal parent");
+    std::fs::create_dir(&journal_path).expect("block journal file with directory");
+
+    ThreadStore::append_items(
+        &store,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal.clone()],
+        },
+    )
+    .await
+    .expect_err("blocked journal path should fault the terminal commit");
+
+    std::fs::remove_dir(&journal_path).expect("remove journal blocker");
+
+    let expected = crate::journal::encode_turn_frame(
+        thread_id,
+        "turn-truncated-retry",
+        1,
+        None,
+        Some(&params),
+        &[terminal],
+    )
+    .expect("encode expected frame");
+    let split = expected.bytes.len() / 2;
+    std::fs::write(&journal_path, &expected.bytes[..split]).expect("write truncated tail");
+
+    ThreadStore::flush_thread(&store, thread_id)
+        .await
+        .expect("flush should repair and retry the sealed terminal commit");
+
+    // JOURNAL-NOTE: The retry path must first truncate the corpse fragment,
+    // then append the one canonical frame. Appending after the fragment would
+    // technically be more bytes, which is not the same thing as recovery.
+    let recovered = std::fs::read(&journal_path).expect("read repaired journal");
+    assert_eq!(recovered, expected.bytes);
+}
+
+#[tokio::test]
+async fn flush_syncs_a_complete_unacknowledged_frame_without_appending_it_twice() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().to_path_buf();
+    let thread_id = ThreadId::new();
+    let params = create_thread_params(thread_id);
+    let terminal = terminal_turn("turn-sync-retry");
+    let journal_path = crate::journal::journal_thread_path(&root, thread_id);
+
+    let store = RamJournalThreadStore::new("sync-retry", root.clone());
+    ThreadStore::create_thread(&store, params.clone())
+        .await
+        .expect("create resident thread");
+
+    std::fs::create_dir_all(journal_path.parent().expect("journal parent"))
+        .expect("create journal parent");
+    std::fs::create_dir(&journal_path).expect("block journal file with directory");
+
+    ThreadStore::append_items(
+        &store,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal.clone()],
+        },
+    )
+    .await
+    .expect_err("blocked journal path should fault the terminal commit");
+
+    std::fs::remove_dir(&journal_path).expect("remove journal blocker");
+
+    let expected = crate::journal::encode_turn_frame(
+        thread_id,
+        "turn-sync-retry",
+        1,
+        None,
+        Some(&params),
+        &[terminal.clone()],
+    )
+    .expect("encode expected frame");
+    std::fs::write(&journal_path, &expected.bytes).expect("materialize complete unacknowledged frame");
+    let before = std::fs::metadata(&journal_path)
+        .expect("journal metadata before sync retry")
+        .len();
+
+    ThreadStore::flush_thread(&store, thread_id)
+        .await
+        .expect("flush should acknowledge the existing complete frame");
+
+    assert_eq!(
+        std::fs::metadata(&journal_path)
+            .expect("journal metadata after sync retry")
+            .len(),
+        before
+    );
+    assert_eq!(
+        std::fs::read(&journal_path).expect("read synced journal"),
+        expected.bytes
+    );
+
+    ThreadStore::append_items(
+        &store,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal],
+        },
+    )
+    .await
+    .expect("lost acknowledgement replay should remain idempotent");
+
+    // JOURNAL-NOTE: Full frame already present + retry means sync/acknowledge,
+    // not "append it again and let future archaeology sort out the twins."
+    assert_eq!(
+        std::fs::metadata(&journal_path)
+            .expect("journal metadata after acknowledgement replay")
+            .len(),
+        before
+    );
+}

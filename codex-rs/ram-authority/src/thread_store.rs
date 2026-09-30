@@ -44,6 +44,7 @@ struct ThreadJournalState {
     next_sequence: u64,
     last_digest: Option<[u8; 32]>,
     committed_terminals: HashMap<String, [u8; 32]>,
+    commit_faulted: bool,
 }
 
 impl Default for ThreadJournalState {
@@ -53,6 +54,7 @@ impl Default for ThreadJournalState {
             next_sequence: 1,
             last_digest: None,
             committed_terminals: HashMap::new(),
+            commit_faulted: false,
         }
     }
 }
@@ -236,17 +238,119 @@ impl RamJournalThreadStore {
         )
         .map_err(internal_error)?;
 
+        if state.commit_faulted {
+            // JOURNAL-NOTE: A failed attempt can leave one of three things:
+            // no new bytes, a truncated tail, or the complete frame followed by
+            // a failed durability fence. Inspect exactly once on the retry path;
+            // ordinary loaded commits still perform zero journal reads.
+            let reader = self.reader.clone();
+            let recovered = tokio::task::spawn_blocking(move || reader.recover_thread(thread_id))
+                .await
+                .map_err(|error| {
+                    internal_error(format!("journal retry recovery task failed: {error}"))
+                })?
+                .map_err(internal_error)?;
+
+            match recovered {
+                None => {
+                    if state.last_digest.is_some() || sequence != 1 {
+                        return Err(internal_error(
+                            "faulted RamJournal retry lost an existing durable prefix",
+                        ));
+                    }
+                }
+                Some(recovered) => {
+                    let prefix_matches = recovered.last_digest() == state.last_digest
+                        && recovered.next_sequence() == sequence;
+
+                    if recovered.truncated_tail {
+                        if !prefix_matches {
+                            return Err(internal_error(
+                                "faulted RamJournal tail does not follow the resident durable head",
+                            ));
+                        }
+
+                        let writer = self.journal.clone();
+                        let valid_bytes = recovered.valid_bytes;
+                        tokio::task::spawn_blocking(move || {
+                            writer.truncate_to_verified_prefix(thread_id, valid_bytes)
+                        })
+                        .await
+                        .map_err(|error| {
+                            internal_error(format!(
+                                "journal retry tail cleanup task failed: {error}"
+                            ))
+                        })?
+                        .map_err(internal_error)?;
+                    } else if recovered.last_digest() == Some(frame.digest)
+                        && recovered
+                            .frames
+                            .last()
+                            .is_some_and(|recovered_frame| {
+                                recovered_frame.sequence == sequence
+                                    && recovered_frame.turn_id == sealed.turn_id
+                            })
+                    {
+                        // The data write completed and only the durability fence
+                        // failed. Do not append the same turn twice; sync the
+                        // already verified bytes and acknowledge that frame.
+                        let writer = self.journal.clone();
+                        tokio::task::spawn_blocking(move || writer.sync_thread(thread_id))
+                            .await
+                            .map_err(|error| {
+                                internal_error(format!(
+                                    "journal retry sync task failed: {error}"
+                                ))
+                            })?
+                            .map_err(internal_error)?;
+
+                        state
+                            .pending
+                            .mark_committed(&sealed.turn_id)
+                            .map_err(internal_error)?;
+                        state
+                            .committed_terminals
+                            .insert(terminal.turn_id, terminal.digest);
+                        state.last_digest = Some(frame.digest);
+                        state.next_sequence = state
+                            .next_sequence
+                            .checked_add(1)
+                            .ok_or_else(|| internal_error("journal sequence overflow"))?;
+                        state.commit_faulted = false;
+                        return Ok(());
+                    } else if !prefix_matches {
+                        return Err(internal_error(
+                            "faulted RamJournal retry found an unexpected durable tail",
+                        ));
+                    }
+                }
+            }
+
+            state.commit_faulted = false;
+        }
+
         let frame_digest = frame.digest;
         let writer = self.journal.clone();
-        tokio::task::spawn_blocking(move || writer.append_turn_frame(thread_id, &frame))
-            .await
-            .map_err(|error| internal_error(format!("journal writer task failed: {error}")))?
-            .map_err(internal_error)?;
+        let append_result =
+            tokio::task::spawn_blocking(move || writer.append_turn_frame(thread_id, &frame))
+                .await
+                .map_err(|error| {
+                    internal_error(format!("journal writer task failed: {error}"))
+                });
 
-        // JOURNAL-NOTE: Pending resident state advances only after the complete
-        // frame append and sync_data() both succeed. If either fails, this exact
-        // sealed turn remains in RAM so flush/retry can settle it without
-        // manufacturing another resident terminal event.
+        let append_result = match append_result {
+            Ok(result) => result.map_err(internal_error),
+            Err(error) => Err(error),
+        };
+
+        if let Err(error) = append_result {
+            // JOURNAL-NOTE: Keep the exact sealed transaction resident and mark
+            // the disk tail suspect. The next retry reconciles the journal
+            // before it considers another data write.
+            state.commit_faulted = true;
+            return Err(error);
+        }
+
         state
             .pending
             .mark_committed(&sealed.turn_id)
@@ -259,6 +363,7 @@ impl RamJournalThreadStore {
             .next_sequence
             .checked_add(1)
             .ok_or_else(|| internal_error("journal sequence overflow"))?;
+        state.commit_faulted = false;
 
         Ok(())
     }

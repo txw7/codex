@@ -105,6 +105,12 @@ impl ResidentHistories {
         })
     }
 
+    pub fn frame_count(&self, thread_id: ThreadId) -> usize {
+        self.with(thread_id, |history| {
+            history.map(|history| history.frames().len()).unwrap_or(0)
+        })
+    }
+
     pub fn remove(&self, thread_id: ThreadId) -> Option<ResidentHistory> {
         self.threads
             .lock()

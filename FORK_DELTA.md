@@ -251,3 +251,46 @@ Explicitly still in progress:
 - those require explicit storage-neutral abstractions rather than another superficial config branch.
 
 The goal coupling is intentionally called out instead of being hidden behind "Phase 04 mostly done". A side authority does not stop being authoritative because the roadmap is impatient.
+
+
+### RAM-RUNTIME-003
+
+Upstream seams:
+- `codex_state::GoalStore`
+- goal extension runtime/tool/service storage parameters
+- app-server goal request processor
+- listener-ordered goal resume snapshots
+
+Fork behavior:
+
+- `ThreadGoalStore` extracts the nine goal-state operations the feature actually consumes from `StateRuntime`;
+- the existing SQLite `GoalStore` implements that trait with unchanged SQL behavior;
+- `RamGoalStore` mirrors live goal mutation/accounting semantics in RAM, including stale goal-id fencing, budget-limited transitions, accounting modes, timestamps, and continuation deferrals;
+- `GoalRuntimeHandle`, `GoalToolExecutor`, `GoalExtension`, and `GoalService` now consume `ThreadGoalStore`;
+- optional `StateRuntime` remains only for empty-thread preview presentation metadata;
+- app-server selects one goal authority at the same runtime-store composition seam as queue/graph;
+- ordered resume notifications carry `Arc<dyn ThreadGoalStore>`, not `StateDbHandle`;
+- Local retains its existing cold rollout reconciliation and SQLite implementation;
+- RamJournal goal RPCs currently require a loaded thread.
+
+FORK-INVARIANT:
+
+Goal correctness in RamJournal mode must not require SQLite.
+
+Current durability boundary:
+
+RamJournal goal state is authoritative in RAM while loaded. Goal-update items can enter canonical thread history through existing rollout events, but upstream has no explicit persisted `ThreadGoalCleared` semantic record. Therefore a fresh empty `RamGoalStore` after restart is ambiguous and MUST NOT be emitted as proof that the goal was durably cleared.
+
+Cold standalone goal reconstruction / durable clear moves with explicit administrative journal records in the lineage/administration phase. Until then:
+- cold RamJournal goal RPCs fail explicitly rather than fabricate absence;
+- resume snapshots suppress ambiguous empty RAM goal state.
+
+This is a limitation with a name and a testable boundary, not a SQLite fallback wearing a RAM hat.
+
+### Process logs
+
+`LogDbLayer` remains process-wide SQLite-backed diagnostic/feedback infrastructure at the end of Phase 04.
+
+It is not being mislabeled as thread authority. RAM-ring replacement and persistent-FD containment belong to the strict Linux/runtime phase, where logging, swap, tmpfs/memfd backing, and FD allowlists can be verified together.
+
+Moving it here merely to make the Phase-04 checklist look prettier would confuse process diagnostics with session-state authority and make both designs worse.

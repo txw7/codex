@@ -6,6 +6,7 @@
 use crate::CodexThread;
 use crate::ThreadManager;
 use crate::config::Config;
+use crate::config::ThreadStoreConfig;
 use crate::context::AgentMessageBoardNotification;
 use crate::context::ContextualUserFragment;
 use crate::tools::MULTI_AGENT_V2_NAMESPACE_DESCRIPTION;
@@ -45,7 +46,18 @@ pub fn install_agent_message_board(
         MULTI_AGENT_V2_NAMESPACE_DESCRIPTION,
         |config: &Config| config.multi_agent_v2.tool_namespace.clone(),
         move |config: &Config, tree, caller| {
-            let in_memory = config.multi_agent_v2.message_board_in_memory;
+            let in_memory = config.multi_agent_v2.message_board_in_memory
+                || matches!(
+                    config.experimental_thread_store,
+                    ThreadStoreConfig::RamJournal { .. }
+                );
+
+            // SQLITE-NOTE: RamJournal sessions use the upstream in-memory board
+            // unless a remote board is explicitly configured.
+            //
+            // A RAM-authoritative thread with a SQLite-authoritative side chat
+            // would technically be an architecture. It would just be a silly
+            // one we would have to explain forever.
             // MAv2 supplies tree paths; ephemeral runtimes must not open local SQLite.
             if !config.features.enabled(Feature::AgentMessageBoard)
                 || !config.features.enabled(Feature::MultiAgentV2)

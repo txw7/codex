@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod catalog;
 mod decoded_context_cache;
 mod journal;
 mod pending_turn;

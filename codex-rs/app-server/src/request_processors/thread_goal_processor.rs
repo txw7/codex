@@ -93,13 +93,32 @@ impl ThreadGoalRequestProcessor {
 
     pub(crate) async fn pending_resume_goal_state(
         &self,
-        _thread: &CodexThread,
+        thread: &CodexThread,
     ) -> (bool, Option<Arc<dyn ThreadGoalStore>>) {
-        let emit_thread_goal_update = self.config.features.enabled(Feature::Goals);
-        let goal_store = emit_thread_goal_update
-            .then(|| self.goal_store.clone())
-            .flatten();
-        (emit_thread_goal_update, goal_store)
+        if !self.config.features.enabled(Feature::Goals) {
+            return (false, None);
+        }
+        let Some(goal_store) = self.goal_store.clone() else {
+            return (false, None);
+        };
+
+        if matches!(
+            &self.config.experimental_thread_store,
+            ThreadStoreConfig::RamJournal { .. }
+        ) {
+            // COMPAT-NOTE: Until goal-clear/admin state has a canonical journal
+            // record, an empty post-restart RamGoalStore is ambiguous: it can
+            // mean "cleared" or merely "not reconstructed yet."
+            //
+            // Never serialize that ambiguity as a durable clear notification.
+            let has_resident_goal = goal_store
+                .get_thread_goal(thread.thread_id())
+                .await
+                .is_ok_and(|goal| goal.is_some());
+            return (has_resident_goal, has_resident_goal.then_some(goal_store));
+        }
+
+        (true, Some(goal_store))
     }
 
     pub(crate) async fn restore_inherited_goal_runtime(&self, thread_id: ThreadId) {

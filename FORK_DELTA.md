@@ -205,3 +205,49 @@ Explicitly not claimed yet:
 - multi-process authority fencing and Factory/Bifrost routing.
 
 Those are later phases. Phase 03 makes one loaded thread's history representation honest before we start governing the rest of the process.
+
+
+## Phase 04 runtime-store status
+
+RamJournal now removes three session-scoped SQLite side authorities through existing upstream abstractions.
+
+Implemented:
+
+- `RamAgentGraphStore` implements the complete current `AgentGraphStore` contract in RAM;
+- graph traversal preserves upstream stable ordering and status-filter subtree semantics;
+- `RamQueueStore` implements the complete current `QueueStore` contract in RAM;
+- queue mutations preserve monotonic global change-version and per-thread revision semantics used by app-server watchers;
+- queue capacity, paging, update/delete, and full-permutation reorder semantics remain storage-neutral;
+- app-server queue and graph construction now goes through core-owned backend composition helpers;
+- Local keeps SQLite-backed queue/graph stores;
+- upstream InMemory keeps its existing no-store behavior;
+- RamJournal selects the fork-owned RAM queue/graph stores;
+- RamJournal message boards reuse upstream `InMemoryMessageBoards` unless an explicit remote board is configured.
+
+### RAM-RUNTIME-001
+
+Upstream seams:
+- `QueueStore`
+- `AgentGraphStore`
+- `thread_manager` backend composition
+- app-server `MessageProcessor::new`
+
+Fork behavior: session-scoped queue and agent graph storage follows the same backend selection that owns thread persistence.
+
+Merge rule: new session-scoped stores belong at the central composition boundary. Do not add another backend `match` in app-server because the nearest file had a convenient blank line.
+
+### RAM-RUNTIME-002
+
+Upstream seam: `install_agent_message_board`
+
+Fork behavior: RamJournal selects upstream's existing in-memory message-board implementation unless the user explicitly configured a remote board.
+
+Reason: a RAM-authoritative session does not need a SQLite-authoritative side conversation.
+
+Explicitly still in progress:
+
+- goal state remains coupled to `StateRuntime::thread_goals()` inside both request handling and turn-lifecycle accounting;
+- session runtime logs still have SQLite-backed paths;
+- those require explicit storage-neutral abstractions rather than another superficial config branch.
+
+The goal coupling is intentionally called out instead of being hidden behind "Phase 04 mostly done". A side authority does not stop being authoritative because the roadmap is impatient.

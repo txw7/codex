@@ -79,6 +79,72 @@ fn contains_terminal_turn(items: &[RolloutItem], turn_id: &str) -> bool {
 }
 
 #[tokio::test]
+async fn latest_model_context_cache_is_bounded_and_invalidated_by_new_turns() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let thread_id = ThreadId::new();
+    let store = RamJournalThreadStore::new_with_decoded_context_budget(
+        "decoded-cache",
+        temp.path().to_path_buf(),
+        1024 * 1024,
+    );
+
+    ThreadStore::create_thread(&store, create_thread_params(thread_id))
+        .await
+        .expect("create resident thread");
+    ThreadStore::append_items(
+        &store,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal_turn("turn-cache-1")],
+        },
+    )
+    .await
+    .expect("first turn should commit");
+
+    let first = ThreadStore::load_latest_model_context(
+        &store,
+        LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("first model context materialization");
+    assert!(contains_terminal_turn(&first.items, "turn-cache-1"));
+    assert_eq!(store.decoded_contexts.entry_count(), 1);
+    assert!(store.decoded_contexts.retained_bytes() > 0);
+    assert!(store.decoded_contexts.retained_bytes() <= 1024 * 1024);
+
+    ThreadStore::append_items(
+        &store,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal_turn("turn-cache-2")],
+        },
+    )
+    .await
+    .expect("second turn should commit");
+
+    // RESIDENCY-NOTE: canonical history changed, so the decoded projection is
+    // gone immediately. It is not allowed to become a stale shadow authority.
+    assert_eq!(store.decoded_contexts.entry_count(), 0);
+    assert_eq!(store.decoded_contexts.retained_bytes(), 0);
+
+    let second = ThreadStore::load_latest_model_context(
+        &store,
+        LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("second model context materialization");
+    assert!(contains_terminal_turn(&second.items, "turn-cache-2"));
+    assert_eq!(store.decoded_contexts.entry_count(), 1);
+    assert!(store.decoded_contexts.retained_bytes() <= 1024 * 1024);
+}
+
+#[tokio::test]
 async fn caller_supplied_legacy_history_remains_delegate_authority_without_cjr() {
     let temp = tempfile::tempdir().expect("tempdir");
     let thread_id = ThreadId::new();

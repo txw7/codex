@@ -102,6 +102,17 @@ pub trait ThreadStore: Any + Send + Sync {
         ThreadHistoryMode::Legacy
     }
 
+    /// Whether terminal turn delivery must be withheld until this store reports
+    /// the terminal append as durable.
+    ///
+    /// UPSTREAM-SEAM: Upstream stores keep their existing failure policy by
+    /// default. RamJournal opts in because its public contract is stronger:
+    /// terminal completion is a durability receipt, not an aspirational status
+    /// update emitted while the journal is on fire.
+    fn requires_terminal_durability_before_delivery(&self) -> bool {
+        false
+    }
+
     /// Creates a new live thread.
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()>;
 

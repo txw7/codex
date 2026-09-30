@@ -581,7 +581,6 @@ impl ThreadStore for RamJournalThreadStore {
     }
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
-        let resident = Arc::clone(&self.resident);
         let thread_id = params.thread_id;
         let journal_state = self.journal_state(thread_id);
 
@@ -647,13 +646,13 @@ impl ThreadStore for RamJournalThreadStore {
                 });
             }
 
-            // RAM remains primary. Only after retry/conflict checks does the
-            // resident store observe this append.
-            ThreadStore::append_items(resident.as_ref(), params).await?;
-
-            // COMPAT-NOTE: The durable frame uses upstream's canonical
-            // persistence filter. Raw transient events can remain useful to
-            // runtime observers without becoming surprise journal ontology.
+            // FORK-INVARIANT: Canonical session transcript no longer enters
+            // the upstream in-memory history Vec. Open-turn items live in
+            // PendingTurn; committed turns live as compressed CJR frames.
+            //
+            // Metadata projection remains upstream-owned through
+            // LiveThread::record_thread_metadata. We are removing duplicate
+            // transcript storage, not staging a coup against every useful trait.
             state
                 .pending
                 .push(&persisted_items)

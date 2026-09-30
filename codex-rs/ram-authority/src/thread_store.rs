@@ -553,18 +553,36 @@ impl ThreadStore for RamJournalThreadStore {
     }
 
     fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
-        let thread_id = params.thread_id.clone();
+        let thread_id = params.thread_id;
         let history_mode = params
             .history
             .as_deref()
             .and_then(history_mode_from_items)
             .unwrap_or_default();
+
         Box::pin(async move {
-            if params.history.is_none() {
-                let _ = self.hydrate_from_journal(thread_id.clone()).await?;
+            let already_compressed = self.resident_histories.with(thread_id, |history| {
+                history.is_some_and(|history| !history.frames().is_empty())
+            });
+            let hydrated = if already_compressed {
+                true
+            } else {
+                self.hydrate_from_journal(thread_id).await?
+            };
+
+            let mut resident_params = params;
+            if already_compressed || hydrated {
+                // RESIDENCY-NOTE: Core may hand decoded ResumedHistory back to
+                // ThreadStore after it loaded that history from us. When a CJR
+                // authority exists, do not store that object graph again.
+                //
+                // COMPAT-NOTE: If no RamJournal history exists, preserve the
+                // caller-supplied history. Legacy/external resume paths remain
+                // functional until migration gets its own explicit phase.
+                resident_params.history = None;
             }
 
-            ThreadStore::resume_thread(self.resident.as_ref(), params).await?;
+            ThreadStore::resume_thread(self.resident.as_ref(), resident_params).await?;
             self.history_modes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

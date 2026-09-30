@@ -320,9 +320,23 @@ impl RamJournalThreadStore {
         }
 
         // FORK-RAM: Cold hydration is the only journal-read phase for this
-        // resident lifetime. Reconstruct the complete logical history in RAM,
-        // then ordinary reads return to the resident store.
-        ThreadStore::create_thread(self.resident.as_ref(), bootstrap.clone()).await?;
+        // resident lifetime. Lightweight delegate metadata may survive an
+        // in-process unload; do not recreate it and append another SessionMeta
+        // merely because the compressed frames were evicted.
+        let metadata_exists = ThreadStore::read_thread(
+            self.resident.as_ref(),
+            ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: false,
+            },
+        )
+        .await
+        .is_ok();
+        if !metadata_exists {
+            ThreadStore::create_thread(self.resident.as_ref(), bootstrap.clone()).await?;
+        }
+
         let mut committed_terminals = HashMap::new();
         for frame in &recovered.frames {
             if let Some(previous) = committed_terminals.insert(
@@ -370,7 +384,10 @@ impl RamJournalThreadStore {
         state.next_sequence = recovered.next_sequence();
         state.last_digest = recovered.last_digest();
         state.committed_terminals = committed_terminals;
+        state.commit_faulted = false;
+        drop(state);
 
+        self.mark_loaded(thread_id);
         Ok(true)
     }
 
@@ -603,6 +620,7 @@ impl ThreadStore for RamJournalThreadStore {
         let bootstrap = params.clone();
         Box::pin(async move {
             self.decoded_contexts.invalidate(thread_id);
+            self.mark_loaded(thread_id);
             ThreadStore::create_thread(self.resident.as_ref(), params).await?;
             self.history_modes
                 .lock()
@@ -648,6 +666,7 @@ impl ThreadStore for RamJournalThreadStore {
             }
 
             ThreadStore::resume_thread(self.resident.as_ref(), resident_params).await?;
+            self.mark_loaded(thread_id);
             self.history_modes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

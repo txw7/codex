@@ -11,6 +11,7 @@ use std::sync::Arc;
 mod agent_graph_store;
 mod catalog;
 mod decoded_context_cache;
+mod goal_store;
 mod journal;
 mod pending_turn;
 mod queue_store;
@@ -20,6 +21,7 @@ mod thread_store;
 use codex_thread_store::ThreadStore;
 
 pub use agent_graph_store::RamAgentGraphStore;
+pub use goal_store::RamGoalStore;
 pub use queue_store::RamQueueStore;
 pub use thread_store::RamJournalThreadStore;
 

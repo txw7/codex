@@ -188,6 +188,80 @@ impl RamJournalThreadStore {
 
         Ok(true)
     }
+
+    async fn commit_sealed_turn(
+        &self,
+        thread_id: ThreadId,
+        state: &mut ThreadJournalState,
+    ) -> ThreadStoreResult<()> {
+        let Some(sealed) = state.pending.sealed() else {
+            return Ok(());
+        };
+
+        let terminal = terminal_event_identity(&sealed.items)
+            .map_err(internal_error)?
+            .ok_or_else(|| internal_error("sealed RamJournal turn is missing a terminal event"))?;
+        if terminal.turn_id != sealed.turn_id {
+            return Err(internal_error(format!(
+                "sealed RamJournal turn id {} does not match terminal event {}",
+                sealed.turn_id, terminal.turn_id
+            )));
+        }
+
+        let sequence = state.next_sequence;
+        let bootstrap = if sequence == 1 {
+            Some(
+                self.bootstrap_params
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&thread_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        internal_error(
+                            "first RamJournal commit is missing CreateThreadParams bootstrap",
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        let frame = encode_turn_frame(
+            thread_id,
+            &sealed.turn_id,
+            sequence,
+            state.last_digest,
+            bootstrap.as_ref(),
+            &sealed.items,
+        )
+        .map_err(internal_error)?;
+
+        let frame_digest = frame.digest;
+        let writer = self.journal.clone();
+        tokio::task::spawn_blocking(move || writer.append_turn_frame(thread_id, &frame))
+            .await
+            .map_err(|error| internal_error(format!("journal writer task failed: {error}")))?
+            .map_err(internal_error)?;
+
+        // JOURNAL-NOTE: Pending resident state advances only after the complete
+        // frame append and sync_data() both succeed. If either fails, this exact
+        // sealed turn remains in RAM so flush/retry can settle it without
+        // manufacturing another resident terminal event.
+        state
+            .pending
+            .mark_committed(&sealed.turn_id)
+            .map_err(internal_error)?;
+        state
+            .committed_terminals
+            .insert(terminal.turn_id, terminal.digest);
+        state.last_digest = Some(frame_digest);
+        state.next_sequence = state
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| internal_error("journal sequence overflow"))?;
+
+        Ok(())
+    }
 }
 
 fn history_mode_from_items(items: &[RolloutItem]) -> Option<ThreadHistoryMode> {
@@ -259,9 +333,8 @@ impl ThreadStore for RamJournalThreadStore {
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
         let resident = Arc::clone(&self.resident);
-        let journal = self.journal.clone();
-        let thread_id = params.thread_id.clone();
-        let journal_state = self.journal_state(thread_id.clone());
+        let thread_id = params.thread_id;
+        let journal_state = self.journal_state(thread_id);
 
         Box::pin(async move {
             // FORK-INVARIANT: serialize append/commit activity per thread.
@@ -283,7 +356,7 @@ impl ThreadStore for RamJournalThreadStore {
                 && let Some(committed_digest) =
                     state.committed_terminals.get(&terminal.turn_id)
             {
-                if committed_digest == &terminal.digest {
+                if committed_digest == &terminal.digest && persisted_items.len() == 1 {
                     // JOURNAL-NOTE: Lost acknowledgement retry. The same
                     // terminal event is already durable, so do not mutate RAM
                     // again and definitely do not append another frame.
@@ -291,15 +364,43 @@ impl ThreadStore for RamJournalThreadStore {
                 }
                 return Err(ThreadStoreError::Conflict {
                     message: format!(
-                        "turn {} is already durable with different terminal content",
+                        "turn {} is already durable; retry carries different or additional persisted content",
                         terminal.turn_id
+                    ),
+                });
+            }
+
+            if let Some(sealed) = state.pending.sealed() {
+                let sealed_terminal = terminal_event_identity(&sealed.items)
+                    .map_err(internal_error)?
+                    .ok_or_else(|| {
+                        internal_error("sealed RamJournal turn is missing a terminal event")
+                    })?;
+
+                if let Some(incoming) = terminal.as_ref()
+                    && incoming.turn_id == sealed.turn_id
+                    && incoming.digest == sealed_terminal.digest
+                    && persisted_items.len() == 1
+                {
+                    // JOURNAL-NOTE: The previous durability attempt failed
+                    // after resident state already observed the terminal item.
+                    // Retry the sealed transaction directly; re-appending the
+                    // event would duplicate RAM history before disk even gets
+                    // another chance to behave.
+                    return self.commit_sealed_turn(thread_id, &mut state).await;
+                }
+
+                return Err(ThreadStoreError::Conflict {
+                    message: format!(
+                        "turn {} is sealed but not durable; settle that commit before appending new persisted items",
+                        sealed.turn_id
                     ),
                 });
             }
 
             // RAM remains primary. Only after retry/conflict checks does the
             // resident store observe this append.
-            ThreadStore::append_items(resident.as_ref(), params.clone()).await?;
+            ThreadStore::append_items(resident.as_ref(), params).await?;
 
             // COMPAT-NOTE: The durable frame uses upstream's canonical
             // persistence filter. Raw transient events can remain useful to
@@ -309,66 +410,12 @@ impl ThreadStore for RamJournalThreadStore {
                 .push(&persisted_items)
                 .map_err(internal_error)?;
 
-            let Some(sealed) = state.pending.sealed() else {
+            if state.pending.sealed().is_none() {
                 // FORK-RAM: Nonterminal append. Deliberately no persistent I/O.
                 return Ok(());
-            };
-
-            let sequence = state.next_sequence;
-            let bootstrap = if sequence == 1 {
-                Some(
-                    self.bootstrap_params
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .get(&thread_id)
-                        .cloned()
-                        .ok_or_else(|| {
-                            internal_error(
-                                "first RamJournal commit is missing CreateThreadParams bootstrap",
-                            )
-                        })?,
-                )
-            } else {
-                None
-            };
-            let frame = encode_turn_frame(
-                thread_id.clone(),
-                &sealed.turn_id,
-                sequence,
-                state.last_digest,
-                bootstrap.as_ref(),
-                &sealed.items,
-            )
-            .map_err(internal_error)?;
-
-            let frame_digest = frame.digest;
-            let writer = journal.clone();
-            let write_thread_id = thread_id.clone();
-            tokio::task::spawn_blocking(move || {
-                writer.append_turn_frame(write_thread_id, &frame)
-            })
-            .await
-            .map_err(|error| internal_error(format!("journal writer task failed: {error}")))?
-            .map_err(internal_error)?;
-
-            // JOURNAL-NOTE: Resident pending state advances only after the
-            // complete frame has been appended and sync_data() has succeeded.
-            state
-                .pending
-                .mark_committed(&sealed.turn_id)
-                .map_err(internal_error)?;
-            if let Some(terminal) = terminal {
-                state
-                    .committed_terminals
-                    .insert(terminal.turn_id, terminal.digest);
             }
-            state.last_digest = Some(frame_digest);
-            state.next_sequence = state
-                .next_sequence
-                .checked_add(1)
-                .ok_or_else(|| internal_error("journal sequence overflow"))?;
 
-            Ok(())
+            self.commit_sealed_turn(thread_id, &mut state).await
         })
     }
 
@@ -384,8 +431,19 @@ impl ThreadStore for RamJournalThreadStore {
     }
 
     fn flush_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
-        // FORK-RAM: A pre-terminal flush does not manufacture disk traffic.
-        ThreadStore::flush_thread(self.resident.as_ref(), thread_id)
+        Box::pin(async move {
+            let journal_state = self.journal_state(thread_id);
+            let mut state = journal_state.lock().await;
+
+            // FORK-RAM: A pre-terminal flush still creates no disk traffic.
+            // A sealed turn means a prior terminal commit attempt failed, so
+            // flush is the durability fence that retries that exact resident
+            // transaction without re-appending its terminal event.
+            self.commit_sealed_turn(thread_id, &mut state).await?;
+            drop(state);
+
+            ThreadStore::flush_thread(self.resident.as_ref(), thread_id).await
+        })
     }
 
     fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {

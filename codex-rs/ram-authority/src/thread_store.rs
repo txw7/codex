@@ -132,6 +132,27 @@ impl RamJournalThreadStore {
             .clone()
     }
 
+    fn existing_journal_state(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<Arc<AsyncMutex<ThreadJournalState>>> {
+        self.journal_states
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&thread_id)
+            .cloned()
+    }
+
+    fn release_heavy_residency(&self, thread_id: ThreadId) {
+        self.resident_histories.remove(thread_id);
+        self.decoded_contexts.invalidate(thread_id);
+        self.journal_states
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&thread_id);
+        self.mark_unloaded(thread_id);
+    }
+
     fn has_ram_journal_authority(&self, thread_id: ThreadId) -> bool {
         self.bootstrap_params
             .lock()
@@ -798,7 +819,51 @@ impl ThreadStore for RamJournalThreadStore {
     }
 
     fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
-        ThreadStore::shutdown_thread(self.resident.as_ref(), thread_id)
+        Box::pin(async move {
+            if self.has_ram_journal_authority(thread_id)
+                && let Some(journal_state) = self.existing_journal_state(thread_id)
+            {
+                let mut state = journal_state.lock().await;
+
+                if state.pending.sealed().is_some() {
+                    // RESIDENCY-NOTE: shutdown may be the final durability fence
+                    // after an earlier terminal append/sync fault. Settle that
+                    // exact sealed transaction before releasing its RAM state.
+                    self.commit_sealed_turn(thread_id, &mut state).await?;
+                }
+
+                if !state.pending.is_empty() {
+                    return Err(internal_error(format!(
+                        "refusing to unload thread {thread_id} with an open RamJournal transaction"
+                    )));
+                }
+                if state.commit_faulted {
+                    return Err(internal_error(format!(
+                        "refusing to unload thread {thread_id} with an unresolved journal fault"
+                    )));
+                }
+            }
+
+            ThreadStore::shutdown_thread(self.resident.as_ref(), thread_id).await?;
+
+            if self.has_ram_journal_authority(thread_id)
+                && self.resident_histories.frame_count(thread_id) > 0
+            {
+                // RESIDENCY-NOTE: Upstream has already established that this
+                // runtime is idle/unsubscribed before app-server unload reaches
+                // us. Release the heavy canonical session bytes here instead of
+                // inventing a competing residency scheduler inside storage.
+                //
+                // Bootstrap/history metadata stays small and resident so list
+                // views remain cheap. A subsequent history/model-context read
+                // will perform one explicit cold CJR hydration.
+                self.release_heavy_residency(thread_id);
+            } else {
+                self.decoded_contexts.invalidate(thread_id);
+            }
+
+            Ok(())
+        })
     }
 
     fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {

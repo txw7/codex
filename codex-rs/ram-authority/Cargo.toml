@@ -13,6 +13,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+chrono = { workspace = true }
 codex-agent-graph-store = { workspace = true }
 codex-state = { workspace = true }
 blake3 = { workspace = true }
@@ -22,7 +23,7 @@ codex-thread-store = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
-uuid = { workspace = true, features = ["v7"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
 zstd = { workspace = true }
 
 [dev-dependencies]

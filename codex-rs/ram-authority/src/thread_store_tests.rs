@@ -895,3 +895,54 @@ async fn flush_syncs_a_complete_unacknowledged_frame_without_appending_it_twice(
         before
     );
 }
+
+
+#[tokio::test]
+async fn unload_refuses_when_resident_head_diverges_from_durable_head() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().to_path_buf();
+    let thread_id = ThreadId::new();
+
+    let store = RamJournalThreadStore::new("unload-head-fence", root);
+    ThreadStore::create_thread(&store, create_thread_params(thread_id))
+        .await
+        .expect("create resident thread");
+    ThreadStore::append_items(
+        &store,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal_turn("turn-head-1")],
+        },
+    )
+    .await
+    .expect("first turn should commit");
+
+    let durable_head = store
+        .resident_histories
+        .last_digest(thread_id)
+        .expect("committed resident head");
+    let fake = crate::journal::encode_turn_frame(
+        thread_id,
+        "turn-head-not-durable",
+        2,
+        Some(durable_head),
+        None,
+        &[terminal_turn("turn-head-not-durable")],
+    )
+    .expect("encode fake resident-only frame");
+
+    // Deliberately corrupt the RAM/durable equivalence witness without touching
+    // the journal. This is not a valid runtime transition; it is an adversarial
+    // test of the unload fence.
+    store.resident_histories.push(thread_id, fake);
+
+    let err = ThreadStore::shutdown_thread(&store, thread_id)
+        .await
+        .expect_err("unload must refuse a divergent resident head");
+
+    // FORK-INVARIANT: eviction requires exact committed-head equality.
+    // Equal turn counts, cheerful comments, and wishful thinking are not
+    // accepted substitutes for the digest witness.
+    assert!(err.to_string().contains("resident head does not match durable head"));
+    assert_eq!(store.resident_histories.frame_count(thread_id), 2);
+}

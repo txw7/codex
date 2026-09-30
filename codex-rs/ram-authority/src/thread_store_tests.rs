@@ -79,6 +79,110 @@ fn contains_terminal_turn(items: &[RolloutItem], turn_id: &str) -> bool {
 }
 
 #[tokio::test]
+async fn shutdown_evicts_heavy_residency_and_history_read_cold_loads_once() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().to_path_buf();
+    let thread_id = ThreadId::new();
+    let journal_path = crate::journal::journal_thread_path(&root, thread_id);
+    let store = RamJournalThreadStore::new_with_decoded_context_budget(
+        "whole-thread-unload",
+        root,
+        1024 * 1024,
+    );
+
+    ThreadStore::create_thread(&store, create_thread_params(thread_id))
+        .await
+        .expect("create resident thread");
+    ThreadStore::append_items(
+        &store,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal_turn("turn-unload")],
+        },
+    )
+    .await
+    .expect("terminal turn should commit");
+    ThreadStore::load_latest_model_context(
+        &store,
+        LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("populate decoded hot cache");
+
+    assert_eq!(store.resident_histories.frame_count(thread_id), 1);
+    assert_eq!(store.decoded_contexts.entry_count(), 1);
+    assert!(!store.is_unloaded(thread_id));
+
+    ThreadStore::shutdown_thread(&store, thread_id)
+        .await
+        .expect("idle durable thread should unload");
+
+    assert!(store.is_unloaded(thread_id));
+    assert_eq!(store.resident_histories.frame_count(thread_id), 0);
+    assert_eq!(store.decoded_contexts.entry_count(), 0);
+
+    let page = ThreadStore::list_threads(
+        &store,
+        ListThreadsParams {
+            page_size: 100,
+            cursor: None,
+            sort_key: ThreadSortKey::CreatedAt,
+            sort_direction: SortDirection::Desc,
+            allowed_sources: Vec::new(),
+            model_providers: None,
+            cwd_filters: None,
+            section: None,
+            project_id: None,
+            archived: false,
+            search_term: None,
+            relation_filter: None,
+            use_state_db_only: false,
+        },
+    )
+    .await
+    .expect("metadata-only list after unload");
+    assert!(page.items.iter().any(|thread| thread.thread_id == thread_id));
+
+    // RESIDENCY-NOTE: listing uses retained lightweight metadata. It does not
+    // cold-load the transcript just to draw a row.
+    assert!(store.is_unloaded(thread_id));
+    assert_eq!(store.resident_histories.frame_count(thread_id), 0);
+
+    let loaded = ThreadStore::load_history(
+        &store,
+        LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("first history read should cold hydrate");
+    assert!(contains_terminal_turn(&loaded.items, "turn-unload"));
+    assert!(!store.is_unloaded(thread_id));
+    assert_eq!(store.resident_histories.frame_count(thread_id), 1);
+
+    std::fs::remove_file(&journal_path).expect("remove journal after explicit cold load");
+
+    let resident_again = ThreadStore::load_history(
+        &store,
+        LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("loaded history should remain disk-independent");
+    assert!(contains_terminal_turn(&resident_again.items, "turn-unload"));
+
+    // FORK-INVARIANT: once reloaded, complete logical history is RAM-resident
+    // again. Disk does not receive an encore because the caller asked twice.
+    assert_eq!(store.resident_histories.frame_count(thread_id), 1);
+}
+
+#[tokio::test]
 async fn latest_model_context_cache_is_bounded_and_invalidated_by_new_turns() {
     let temp = tempfile::tempdir().expect("tempdir");
     let thread_id = ThreadId::new();

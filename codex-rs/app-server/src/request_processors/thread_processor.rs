@@ -4468,7 +4468,7 @@ impl ThreadRequestProcessor {
                 )));
             };
 
-            let (emit_thread_goal_update, thread_goal_state_db) = self
+            let (emit_thread_goal_update, thread_goal_store) = self
                 .thread_goal_processor
                 .pending_resume_goal_state(existing_thread.as_ref())
                 .await;
@@ -4534,7 +4534,7 @@ impl ThreadRequestProcessor {
                     instruction_sources,
                     thread_summary,
                     emit_thread_goal_update,
-                    thread_goal_state_db,
+                    thread_goal_store,
                     include_turns,
                     initial_turns_page: params.initial_turns_page.clone(),
                     paginated_turns,

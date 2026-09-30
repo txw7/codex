@@ -80,9 +80,11 @@ use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_ram_authority::RamAgentGraphStore;
+use codex_ram_authority::RamGoalStore;
 use codex_ram_authority::RamQueueStore;
 use codex_ram_authority::build_bootstrap_thread_store;
 use codex_rollout::state_db::StateDbHandle;
+use codex_state::ThreadGoalStore;
 use codex_skills_extension::HostSkillsService;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LoadThreadHistoryParams;
@@ -564,6 +566,25 @@ pub fn agent_graph_store_from_config(
             // FORK-RAM: graph topology is live RAM state; durable ancestry will
             // come from journal lineage rather than a shadow SQLite monarchy.
             Some(Arc::new(RamAgentGraphStore::default()))
+        }
+        ThreadStoreConfig::InMemory { .. } => None,
+    }
+}
+
+pub fn goal_store_from_config(
+    config: &Config,
+    state_db: Option<&StateDbHandle>,
+) -> Option<Arc<dyn ThreadGoalStore>> {
+    match &config.experimental_thread_store {
+        ThreadStoreConfig::Local => state_db.map(|state_db| {
+            Arc::new(state_db.thread_goals().clone()) as Arc<dyn ThreadGoalStore>
+        }),
+        ThreadStoreConfig::RamJournal { .. } => {
+            // FORK-RAM: live goal state follows the session authority into RAM.
+            //
+            // Goal changes still enter canonical rollout/journal history through
+            // ThreadGoalUpdated items. SQLite does not need a parallel vote.
+            Some(Arc::new(RamGoalStore::default()))
         }
         ThreadStoreConfig::InMemory { .. } => None,
     }

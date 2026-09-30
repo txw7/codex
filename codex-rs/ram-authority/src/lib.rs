@@ -40,11 +40,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bootstrap_backend_is_the_explicit_in_memory_authority() {
+    fn bootstrap_backend_is_the_fork_owned_ram_authority() {
         let store = build_bootstrap_thread_store("ram-authority-bootstrap-test");
 
-        // FORK-INVARIANT: Phase 01 must resolve to a RAM-owned implementation,
-        // not LocalThreadStore with a more aspirational config name.
-        assert!(store.as_any().is::<InMemoryThreadStore>());
+        // FORK-INVARIANT: Core must receive the fork-owned runtime type.
+        //
+        // If this starts reporting InMemoryThreadStore directly again, somebody
+        // has helpfully turned "RamJournal" back into a config alias.
+        let ram_store = store
+            .as_any()
+            .downcast_ref::<RamJournalThreadStore>()
+            .expect("ram_journal must resolve to RamJournalThreadStore");
+
+        // Phase 01 still delegates semantics to upstream's in-memory store.
+        // Later phases replace this delegate behind the same fork-owned type.
+        let _bootstrap_delegate = ram_store.bootstrap_inner();
     }
 }

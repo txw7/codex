@@ -74,3 +74,20 @@ The first executable RamJournal slice is intentionally conservative:
 This is a proof scaffold, not the final representation.
 
 The next phase replaces expanded resident history with `PendingTurnV1` plus terminal CJR commits. Until that work lands, any comment claiming one-turn-one-append would be marketing, and this fork has enough maintenance obligations without maintaining fictional accomplishments.
+
+
+### RAM-TS-004
+
+Upstream symbol: `codex_thread_store::ThreadStore`
+
+Fork behavior: wraps the complete current trait surface in `RamJournalThreadStore` while Phase 01 delegates semantics to upstream `InMemoryThreadStore`.
+
+Reason: core must see a fork-owned production backend identity before journal/residency behavior begins to diverge.
+
+Fork implementation: `codex-rs/ram-authority/src/thread_store.rs`
+
+Merge rule: when upstream adds or changes ThreadStore methods, update the wrapper deliberately. Do not allow a newly added upstream capability to vanish merely because the fork wrapper forgot it exists.
+
+Test expectation: RamJournal resolves to `RamJournalThreadStore`; Phase 01 delegate remains in-memory and carries no StateDbHandle.
+
+Snark note: owning the wrapper means future storage physics can change behind one seam instead of making `thread_manager.rs` participate in every new architectural hobby.

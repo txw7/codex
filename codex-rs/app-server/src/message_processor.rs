@@ -492,6 +492,7 @@ impl MessageProcessor {
             Arc::clone(&config),
             thread_state_manager.clone(),
             state_db.clone(),
+            goal_store.clone(),
             Arc::clone(&goal_service),
             config_manager.clone(),
         );

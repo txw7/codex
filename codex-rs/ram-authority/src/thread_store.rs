@@ -36,6 +36,7 @@ use codex_thread_store::ThreadStoreResult;
 use codex_thread_store::UpdateThreadMetadataParams;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::catalog::ResidentCatalog;
 use crate::decoded_context_cache::DecodedContextCache;
 use crate::journal::JournalReader;
 use crate::journal::JournalWriter;
@@ -129,6 +130,7 @@ pub struct RamJournalThreadStore {
     history_modes: Mutex<HashMap<ThreadId, ThreadHistoryMode>>,
     bootstrap_params: Mutex<HashMap<ThreadId, CreateThreadParams>>,
     resident_histories: ResidentHistories,
+    catalog: ResidentCatalog,
     decoded_contexts: DecodedContextCache,
     unloaded_threads: Mutex<HashSet<ThreadId>>,
     checkpoint_policy: CheckpointPolicy,
@@ -171,6 +173,7 @@ impl RamJournalThreadStore {
             history_modes: Mutex::new(HashMap::new()),
             bootstrap_params: Mutex::new(HashMap::new()),
             resident_histories: ResidentHistories::default(),
+            catalog: ResidentCatalog::default(),
             decoded_contexts: DecodedContextCache::new(decoded_context_budget_bytes),
             unloaded_threads: Mutex::new(HashSet::new()),
             checkpoint_policy,

@@ -41,6 +41,7 @@ use crate::journal::JournalReader;
 use crate::journal::JournalWriter;
 use crate::journal::decode_turn_frame;
 use crate::journal::encode_turn_frame;
+use crate::journal::encode_turn_frame_with_checkpoint;
 use crate::pending_turn::PendingTurn;
 use crate::pending_turn::terminal_event_identity;
 use crate::resident_history::ResidentHistories;
@@ -49,6 +50,40 @@ use crate::resident_history::ResidentHistories;
 // The cache is byte-bounded today; Phase 03/06 telemetry and deployment config
 // can tune the number without changing the authority model.
 const DEFAULT_DECODED_CONTEXT_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const DEFAULT_CHECKPOINT_TURN_INTERVAL: u64 = 32;
+const DEFAULT_CHECKPOINT_DELTA_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct CheckpointPolicy {
+    turn_interval: u64,
+    delta_bytes: usize,
+}
+
+impl Default for CheckpointPolicy {
+    fn default() -> Self {
+        Self {
+            turn_interval: DEFAULT_CHECKPOINT_TURN_INTERVAL,
+            delta_bytes: DEFAULT_CHECKPOINT_DELTA_BYTES,
+        }
+    }
+}
+
+impl CheckpointPolicy {
+    fn is_due(
+        self,
+        turns_since_checkpoint: u64,
+        bytes_since_checkpoint: usize,
+        next_turn_uncompressed_bytes: u64,
+    ) -> bool {
+        let turn_due = self.turn_interval > 0
+            && turns_since_checkpoint.saturating_add(1) >= self.turn_interval;
+        let next_bytes =
+            usize::try_from(next_turn_uncompressed_bytes).unwrap_or(usize::MAX);
+        let byte_due = self.delta_bytes > 0
+            && bytes_since_checkpoint.saturating_add(next_bytes) >= self.delta_bytes;
+        turn_due || byte_due
+    }
+}
 
 #[derive(Debug)]
 struct ThreadJournalState {
@@ -57,6 +92,8 @@ struct ThreadJournalState {
     last_digest: Option<[u8; 32]>,
     committed_terminals: HashMap<String, [u8; 32]>,
     commit_faulted: bool,
+    turns_since_checkpoint: u64,
+    bytes_since_checkpoint: usize,
 }
 
 impl Default for ThreadJournalState {
@@ -67,6 +104,8 @@ impl Default for ThreadJournalState {
             last_digest: None,
             committed_terminals: HashMap::new(),
             commit_faulted: false,
+            turns_since_checkpoint: 0,
+            bytes_since_checkpoint: 0,
         }
     }
 }
@@ -92,14 +131,16 @@ pub struct RamJournalThreadStore {
     resident_histories: ResidentHistories,
     decoded_contexts: DecodedContextCache,
     unloaded_threads: Mutex<HashSet<ThreadId>>,
+    checkpoint_policy: CheckpointPolicy,
 }
 
 impl RamJournalThreadStore {
     pub fn new(id: &str, journal_root: PathBuf) -> Self {
-        Self::new_with_decoded_context_budget(
+        Self::new_with_policies(
             id,
             journal_root,
             DEFAULT_DECODED_CONTEXT_CACHE_BYTES,
+            CheckpointPolicy::default(),
         )
     }
 
@@ -107,6 +148,20 @@ impl RamJournalThreadStore {
         id: &str,
         journal_root: PathBuf,
         decoded_context_budget_bytes: usize,
+    ) -> Self {
+        Self::new_with_policies(
+            id,
+            journal_root,
+            decoded_context_budget_bytes,
+            CheckpointPolicy::default(),
+        )
+    }
+
+    fn new_with_policies(
+        id: &str,
+        journal_root: PathBuf,
+        decoded_context_budget_bytes: usize,
+        checkpoint_policy: CheckpointPolicy,
     ) -> Self {
         Self {
             resident: InMemoryThreadStore::for_id(id),
@@ -118,7 +173,41 @@ impl RamJournalThreadStore {
             resident_histories: ResidentHistories::default(),
             decoded_contexts: DecodedContextCache::new(decoded_context_budget_bytes),
             unloaded_threads: Mutex::new(HashSet::new()),
+            checkpoint_policy,
         }
+    }
+
+    fn note_committed_frame(
+        state: &mut ThreadJournalState,
+        frame: &crate::journal::EncodedTurnFrame,
+    ) {
+        if frame.has_checkpoint {
+            state.turns_since_checkpoint = 0;
+            state.bytes_since_checkpoint = 0;
+            return;
+        }
+
+        state.turns_since_checkpoint = state.turns_since_checkpoint.saturating_add(1);
+        let frame_bytes = usize::try_from(frame.uncompressed_len).unwrap_or(usize::MAX);
+        state.bytes_since_checkpoint =
+            state.bytes_since_checkpoint.saturating_add(frame_bytes);
+    }
+
+    fn checkpoint_distance(
+        frames: &[crate::journal::RecoveredFrame],
+    ) -> (u64, usize) {
+        let suffix = frames
+            .iter()
+            .rposition(|frame| frame.encoded.has_checkpoint)
+            .map_or(frames, |index| &frames[index + 1..]);
+
+        let turns = u64::try_from(suffix.len()).unwrap_or(u64::MAX);
+        let bytes = suffix.iter().fold(0_usize, |total, frame| {
+            total.saturating_add(
+                usize::try_from(frame.encoded.uncompressed_len).unwrap_or(usize::MAX),
+            )
+        });
+        (turns, bytes)
     }
 
     fn journal_state(&self, thread_id: ThreadId) -> Arc<AsyncMutex<ThreadJournalState>> {
@@ -458,10 +547,14 @@ impl RamJournalThreadStore {
 
         let journal_state = self.journal_state(thread_id);
         let mut state = journal_state.lock().await;
+        let (turns_since_checkpoint, bytes_since_checkpoint) =
+            Self::checkpoint_distance(&recovered.frames);
         state.next_sequence = recovered.next_sequence();
         state.last_digest = recovered.last_digest();
         state.committed_terminals = committed_terminals;
         state.commit_faulted = false;
+        state.turns_since_checkpoint = turns_since_checkpoint;
+        state.bytes_since_checkpoint = bytes_since_checkpoint;
         drop(state);
 
         self.mark_loaded(thread_id);

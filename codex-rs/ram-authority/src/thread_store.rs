@@ -148,20 +148,18 @@ impl RamJournalThreadStore {
         ThreadStore::create_thread(self.resident.as_ref(), bootstrap.clone()).await?;
         let mut committed_terminals = HashMap::new();
         for frame in &recovered.frames {
-            let terminal = terminal_event_identity(&frame.items)
-                .map_err(internal_error)?
-                .ok_or_else(|| internal_error("recovered CJR frame is missing terminal identity"))?;
-            if let Some(previous) =
-                committed_terminals.insert(terminal.turn_id.clone(), terminal.digest)
-            {
+            if let Some(previous) = committed_terminals.insert(
+                frame.encoded.turn_id.clone(),
+                frame.terminal_digest,
+            ) {
                 return Err(internal_error(format!(
                     "journal contains duplicate durable turn id {} with digests {:x?} and {:x?}",
-                    terminal.turn_id, previous, terminal.digest
+                    frame.encoded.turn_id, previous, frame.terminal_digest
                 )));
             }
         }
 
-        let recovered_items = recovered.items();
+        let recovered_items = recovered.items().map_err(internal_error)?;
         if !recovered_items.is_empty() {
             ThreadStore::append_items(
                 self.resident.as_ref(),
@@ -287,8 +285,8 @@ impl RamJournalThreadStore {
                             .frames
                             .last()
                             .is_some_and(|recovered_frame| {
-                                recovered_frame.sequence == sequence
-                                    && recovered_frame.turn_id == sealed.turn_id
+                                recovered_frame.encoded.sequence == sequence
+                                    && recovered_frame.encoded.turn_id == sealed.turn_id
                             })
                     {
                         // The data write completed and only the durability fence

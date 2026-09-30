@@ -6,7 +6,10 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::ModelContextScan;
+use codex_rollout::ModelContextScanProgress;
 use codex_rollout::RolloutItem;
 use codex_rollout::persisted_rollout_items;
 use codex_thread_store::AppendThreadItemsParams;
@@ -34,9 +37,11 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::journal::JournalReader;
 use crate::journal::JournalWriter;
+use crate::journal::decode_turn_frame;
 use crate::journal::encode_turn_frame;
 use crate::pending_turn::PendingTurn;
 use crate::pending_turn::terminal_event_identity;
+use crate::resident_history::ResidentHistories;
 
 #[derive(Debug)]
 struct ThreadJournalState {
@@ -66,9 +71,10 @@ impl Default for ThreadJournalState {
 /// ordinary appends mutate RAM only, while a terminal turn is encoded and
 /// journaled before append_items() returns.
 ///
-/// The complete history is still expanded in memory. Compression residency is
-/// Phase 03. We are changing one axis at a time because storage bugs become
-/// remarkably philosophical when representation and durability change together.
+/// Phase 03 introduces ResidentHistories beside the existing expanded delegate
+/// first. The following commits move hydration, writes, and reads across that
+/// boundary separately so each authority change has a receipt instead of one
+/// impressive 500-line shrug.
 pub struct RamJournalThreadStore {
     resident: Arc<InMemoryThreadStore>,
     journal: JournalWriter,
@@ -76,6 +82,7 @@ pub struct RamJournalThreadStore {
     journal_states: Mutex<HashMap<ThreadId, Arc<AsyncMutex<ThreadJournalState>>>>,
     history_modes: Mutex<HashMap<ThreadId, ThreadHistoryMode>>,
     bootstrap_params: Mutex<HashMap<ThreadId, CreateThreadParams>>,
+    resident_histories: ResidentHistories,
 }
 
 impl RamJournalThreadStore {
@@ -87,6 +94,7 @@ impl RamJournalThreadStore {
             journal_states: Mutex::new(HashMap::new()),
             history_modes: Mutex::new(HashMap::new()),
             bootstrap_params: Mutex::new(HashMap::new()),
+            resident_histories: ResidentHistories::default(),
         }
     }
 
@@ -99,6 +107,114 @@ impl RamJournalThreadStore {
             .entry(thread_id)
             .or_insert_with(|| Arc::new(AsyncMutex::new(ThreadJournalState::default())))
             .clone()
+    }
+
+    async fn session_meta_line(&self, thread_id: ThreadId) -> ThreadStoreResult<SessionMetaLine> {
+        let context = ThreadStore::load_latest_model_context(
+            self.resident.as_ref(),
+            LoadThreadHistoryParams {
+                thread_id,
+                include_archived: true,
+            },
+        )
+        .await?;
+
+        context
+            .items
+            .into_iter()
+            .find_map(|item| match item {
+                RolloutItem::SessionMeta(meta) => Some(meta),
+                _ => None,
+            })
+            .ok_or_else(|| internal_error("resident metadata store is missing SessionMeta"))
+    }
+
+    fn decode_resident_frames(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<Vec<RolloutItem>> {
+        let mut items = Vec::new();
+        for frame in self.resident_histories.frames(thread_id) {
+            let (decoded, consumed) =
+                decode_turn_frame(frame.bytes.as_ref()).map_err(internal_error)?;
+            if consumed != frame.bytes.len() {
+                return Err(internal_error(
+                    "resident CJR frame decoder did not consume the complete frame",
+                ));
+            }
+            items.extend(decoded.items);
+        }
+        Ok(items)
+    }
+
+    async fn pending_items(&self, thread_id: ThreadId) -> Vec<RolloutItem> {
+        let state = self.journal_state(thread_id);
+        state.lock().await.pending.items()
+    }
+
+    async fn materialize_complete_history(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<StoredThreadHistory> {
+        let session_meta = self.session_meta_line(thread_id).await?;
+        let mut items = vec![RolloutItem::SessionMeta(session_meta)];
+        items.extend(self.decode_resident_frames(thread_id)?);
+        items.extend(self.pending_items(thread_id).await);
+
+        Ok(StoredThreadHistory { thread_id, items })
+    }
+
+    async fn materialize_latest_model_context(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<StoredModelContext> {
+        let history_mode = self
+            .history_modes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&thread_id)
+            .copied()
+            .unwrap_or_default();
+
+        if history_mode == ThreadHistoryMode::Legacy {
+            let history = self.materialize_complete_history(thread_id).await?;
+            return Ok(StoredModelContext {
+                thread_id,
+                items: history.items,
+            });
+        }
+
+        let session_meta = self.session_meta_line(thread_id).await?;
+        let mut scan = ModelContextScan::default();
+
+        for item in self.pending_items(thread_id).await.into_iter().rev() {
+            if matches!(scan.push(item), ModelContextScanProgress::Complete) {
+                return Ok(StoredModelContext {
+                    thread_id,
+                    items: scan.finish(session_meta),
+                });
+            }
+        }
+
+        'frames: for frame in self.resident_histories.frames(thread_id).into_iter().rev() {
+            let (decoded, consumed) =
+                decode_turn_frame(frame.bytes.as_ref()).map_err(internal_error)?;
+            if consumed != frame.bytes.len() {
+                return Err(internal_error(
+                    "resident CJR frame decoder did not consume the complete frame",
+                ));
+            }
+            for item in decoded.items.into_iter().rev() {
+                if matches!(scan.push(item), ModelContextScanProgress::Complete) {
+                    break 'frames;
+                }
+            }
+        }
+
+        Ok(StoredModelContext {
+            thread_id,
+            items: scan.finish(session_meta),
+        })
     }
 
     async fn hydrate_from_journal(&self, thread_id: ThreadId) -> ThreadStoreResult<bool> {

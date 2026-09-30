@@ -275,6 +275,18 @@ impl RamJournalThreadStore {
             }
         }
 
+        // RESIDENCY-NOTE: Install the verified compressed frame set as one
+        // resident metadata operation. This commit intentionally keeps the old
+        // decoded delegate copy too; the next authority cuts remove that
+        // redundancy after read/write behavior has moved over.
+        self.resident_histories.replace(
+            thread_id,
+            recovered
+                .frames
+                .iter()
+                .map(|frame| frame.encoded.clone()),
+        );
+
         let recovered_items = recovered.items().map_err(internal_error)?;
         if !recovered_items.is_empty() {
             ThreadStore::append_items(

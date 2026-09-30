@@ -539,10 +539,11 @@ impl RamJournalThreadStore {
         //
         // Cold load is allowed to validate history. It does not need to unpack
         // the entire moving truck into a second resident object graph.
+        self.catalog.note_thread(thread_id);
         self.history_modes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(thread_id.clone(), bootstrap.history_mode);
+            .insert(thread_id, bootstrap.history_mode);
         self.bootstrap_params
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -824,6 +825,7 @@ impl ThreadStore for RamJournalThreadStore {
         let bootstrap = params.clone();
         Box::pin(async move {
             self.decoded_contexts.invalidate(thread_id);
+            self.catalog.note_thread(thread_id);
             self.mark_loaded(thread_id);
             ThreadStore::create_thread(self.resident.as_ref(), params).await?;
             self.history_modes

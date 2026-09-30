@@ -289,10 +289,9 @@ impl RamJournalThreadStore {
                 }
             }
 
-            StoredModelContext {
-                thread_id,
-                items: scan.finish(session_meta),
-            }
+            let mut items = scan.finish();
+            items.insert(0, RolloutItem::SessionMeta(session_meta));
+            StoredModelContext { thread_id, items }
         };
 
         self.decoded_contexts.insert(context.clone());

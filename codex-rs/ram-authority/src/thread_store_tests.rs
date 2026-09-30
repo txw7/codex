@@ -701,7 +701,7 @@ async fn thread_list_discovers_a_cold_durable_journal_without_knowing_its_id() {
     // A different resident-store id has no in-memory knowledge of the thread.
     // list_threads must discover the CJR namespace, verify/hydrate the thread,
     // then delegate listing semantics to RAM.
-    let second = RamJournalThreadStore::new("list-reader", root);
+    let second = RamJournalThreadStore::new("list-reader", root.clone());
     let page = ThreadStore::list_threads(
         &second,
         ListThreadsParams {
@@ -723,10 +723,44 @@ async fn thread_list_discovers_a_cold_durable_journal_without_knowing_its_id() {
     .await
     .expect("cold durable thread should be listable");
 
-    // RESIDENCY-NOTE: Phase 02 gets correctness by eagerly hydrating the cold
-    // journal. Phase 03 replaces this with a resident metadata catalog so
-    // listing does not deserialize an entire conversation just to draw a row.
     assert!(page.items.iter().any(|thread| thread.thread_id == thread_id));
+
+    let discovery_root = root.join("v1");
+    std::fs::remove_dir_all(&discovery_root).expect("remove journal placement tree");
+    std::fs::write(&discovery_root, b"not a directory")
+        .expect("poison future journal discovery");
+
+    let resident_page = ThreadStore::list_threads(
+        &second,
+        ListThreadsParams {
+            page_size: 100,
+            cursor: None,
+            sort_key: ThreadSortKey::CreatedAt,
+            sort_direction: SortDirection::Desc,
+            allowed_sources: Vec::new(),
+            model_providers: None,
+            cwd_filters: None,
+            section: None,
+            project_id: None,
+            archived: false,
+            search_term: None,
+            relation_filter: None,
+            use_state_db_only: false,
+        },
+    )
+    .await
+    .expect("resident catalog should make repeated listing disk-independent");
+
+    // FORK-INVARIANT: after cold discovery, ordinary thread/list must not touch
+    // journal placement again. The path is deliberately poisoned above; old
+    // per-call discovery would fail with NotADirectory instead of reaching this
+    // assertion.
+    assert!(
+        resident_page
+            .items
+            .iter()
+            .any(|thread| thread.thread_id == thread_id)
+    );
 }
 
 

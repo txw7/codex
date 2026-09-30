@@ -236,13 +236,45 @@ impl RamJournalThreadStore {
         Ok(StoredThreadHistory { thread_id, items })
     }
 
-    async fn materialize_latest_model_context(
+    async fn build_latest_model_context(
         &self,
         thread_id: ThreadId,
+        pending_items: Vec<RolloutItem>,
     ) -> ThreadStoreResult<StoredModelContext> {
-        if let Some(context) = self.decoded_contexts.get(thread_id) {
-            // RESIDENCY-NOTE: This is the one retained decoded hot projection.
-            // Canonical history remains the compressed frame set underneath it.
+        let frames = self.resident_histories.frames(thread_id);
+
+        if let Some(checkpoint_index) = frames.iter().rposition(|frame| frame.has_checkpoint) {
+            let checkpoint_frame = &frames[checkpoint_index];
+            let (decoded, consumed) =
+                decode_turn_frame(checkpoint_frame.bytes.as_ref()).map_err(internal_error)?;
+            if consumed != checkpoint_frame.bytes.len() {
+                return Err(internal_error(
+                    "checkpoint CJR frame decoder did not consume the complete frame",
+                ));
+            }
+            let mut context = decoded.checkpoint.ok_or_else(|| {
+                internal_error("resident frame advertises checkpoint but payload has none")
+            })?;
+            if context.thread_id != thread_id {
+                return Err(internal_error(
+                    "resident checkpoint belongs to the wrong thread",
+                ));
+            }
+
+            // RESIDENCY-NOTE: The checkpoint is a replay-safe model-context
+            // baseline. Decode only its newer suffix, not every frame that
+            // existed before the checkpoint was born.
+            for frame in frames.iter().skip(checkpoint_index + 1) {
+                let (decoded, consumed) =
+                    decode_turn_frame(frame.bytes.as_ref()).map_err(internal_error)?;
+                if consumed != frame.bytes.len() {
+                    return Err(internal_error(
+                        "resident CJR frame decoder did not consume the complete frame",
+                    ));
+                }
+                context.items.extend(decoded.items);
+            }
+            context.items.extend(pending_items);
             return Ok(context);
         }
 
@@ -254,45 +286,70 @@ impl RamJournalThreadStore {
             .copied()
             .unwrap_or_default();
 
-        let context = if history_mode == ThreadHistoryMode::Legacy {
-            let history = self.materialize_complete_history(thread_id).await?;
-            StoredModelContext {
-                thread_id,
-                items: history.items,
-            }
-        } else {
+        if history_mode == ThreadHistoryMode::Legacy {
             let session_meta = self.session_meta_line(thread_id).await?;
-            let mut scan = ModelContextScan::default();
-            let mut complete = false;
+            let mut items = vec![RolloutItem::SessionMeta(session_meta)];
+            for frame in frames {
+                let (decoded, consumed) =
+                    decode_turn_frame(frame.bytes.as_ref()).map_err(internal_error)?;
+                if consumed != frame.bytes.len() {
+                    return Err(internal_error(
+                        "resident CJR frame decoder did not consume the complete frame",
+                    ));
+                }
+                items.extend(decoded.items);
+            }
+            items.extend(pending_items);
+            return Ok(StoredModelContext { thread_id, items });
+        }
 
-            for item in self.pending_items(thread_id).await.into_iter().rev() {
-                if matches!(scan.push(item), ModelContextScanProgress::Complete) {
-                    complete = true;
-                    break;
+        let session_meta = self.session_meta_line(thread_id).await?;
+        let mut scan = ModelContextScan::default();
+        let mut complete = false;
+
+        for item in pending_items.into_iter().rev() {
+            if matches!(scan.push(item), ModelContextScanProgress::Complete) {
+                complete = true;
+                break;
+            }
+        }
+
+        if !complete {
+            'frames: for frame in frames.into_iter().rev() {
+                let (decoded, consumed) =
+                    decode_turn_frame(frame.bytes.as_ref()).map_err(internal_error)?;
+                if consumed != frame.bytes.len() {
+                    return Err(internal_error(
+                        "resident CJR frame decoder did not consume the complete frame",
+                    ));
+                }
+                for item in decoded.items.into_iter().rev() {
+                    if matches!(scan.push(item), ModelContextScanProgress::Complete) {
+                        break 'frames;
+                    }
                 }
             }
+        }
 
-            if !complete {
-                'frames: for frame in self.resident_histories.frames(thread_id).into_iter().rev() {
-                    let (decoded, consumed) =
-                        decode_turn_frame(frame.bytes.as_ref()).map_err(internal_error)?;
-                    if consumed != frame.bytes.len() {
-                        return Err(internal_error(
-                            "resident CJR frame decoder did not consume the complete frame",
-                        ));
-                    }
-                    for item in decoded.items.into_iter().rev() {
-                        if matches!(scan.push(item), ModelContextScanProgress::Complete) {
-                            break 'frames;
-                        }
-                    }
-                }
-            }
+        let mut items = scan.finish();
+        items.insert(0, RolloutItem::SessionMeta(session_meta));
+        Ok(StoredModelContext { thread_id, items })
+    }
 
-            let mut items = scan.finish();
-            items.insert(0, RolloutItem::SessionMeta(session_meta));
-            StoredModelContext { thread_id, items }
-        };
+    async fn materialize_latest_model_context(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<StoredModelContext> {
+        if let Some(context) = self.decoded_contexts.get(thread_id) {
+            // RESIDENCY-NOTE: This is the one retained decoded hot projection.
+            // Canonical history remains the compressed frame set underneath it.
+            return Ok(context);
+        }
+
+        let pending_items = self.pending_items(thread_id).await;
+        let context = self
+            .build_latest_model_context(thread_id, pending_items)
+            .await?;
 
         self.decoded_contexts.insert(context.clone());
         Ok(context)

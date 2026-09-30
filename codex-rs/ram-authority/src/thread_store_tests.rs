@@ -21,6 +21,7 @@ use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 
+use super::CheckpointPolicy;
 use super::RamJournalThreadStore;
 
 fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
@@ -76,6 +77,149 @@ fn contains_terminal_turn(items: &[RolloutItem], turn_id: &str) -> bool {
                 if event.turn_id == turn_id
         )
     })
+}
+
+#[tokio::test]
+async fn checkpoint_rides_inside_the_due_terminal_frame_and_survives_cold_recovery() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().to_path_buf();
+    let thread_id = ThreadId::new();
+    let policy = CheckpointPolicy {
+        turn_interval: 2,
+        delta_bytes: 0,
+    };
+
+    let first = RamJournalThreadStore::new_with_policies(
+        "checkpoint-writer",
+        root.clone(),
+        1024 * 1024,
+        policy,
+    );
+    ThreadStore::create_thread(&first, create_thread_params(thread_id))
+        .await
+        .expect("create resident thread");
+
+    for turn_id in ["turn-cp-1", "turn-cp-2", "turn-cp-3"] {
+        ThreadStore::append_items(
+            &first,
+            AppendThreadItemsParams {
+                thread_id,
+                items: vec![terminal_turn(turn_id)],
+            },
+        )
+        .await
+        .expect("terminal turn should commit");
+    }
+
+    let frames = first.resident_histories.frames(thread_id);
+    assert_eq!(frames.len(), 3);
+    assert!(!frames[0].has_checkpoint);
+    assert!(frames[1].has_checkpoint);
+    assert!(!frames[2].has_checkpoint);
+
+    let (checkpointed, consumed) =
+        crate::journal::decode_turn_frame(frames[1].bytes.as_ref())
+            .expect("decode checkpointed frame");
+    assert_eq!(consumed, frames[1].bytes.len());
+    let checkpoint = checkpointed.checkpoint.expect("turn 2 checkpoint");
+    assert!(contains_terminal_turn(&checkpoint.items, "turn-cp-1"));
+    assert!(contains_terminal_turn(&checkpoint.items, "turn-cp-2"));
+
+    first.decoded_contexts.invalidate(thread_id);
+    let hot = ThreadStore::load_latest_model_context(
+        &first,
+        LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("checkpoint should reconstruct latest context");
+    assert!(contains_terminal_turn(&hot.items, "turn-cp-1"));
+    assert!(contains_terminal_turn(&hot.items, "turn-cp-2"));
+    assert!(contains_terminal_turn(&hot.items, "turn-cp-3"));
+
+    // JOURNAL-NOTE: three terminal turns produced three frames. The checkpoint
+    // lives inside turn 2; it did not negotiate a fourth append for itself.
+    let recovered = crate::journal::JournalReader::new(root.clone())
+        .recover_thread(thread_id)
+        .expect("recover journal")
+        .expect("journal exists");
+    assert_eq!(recovered.frames.len(), 3);
+    assert!(recovered.frames[1].encoded.has_checkpoint);
+
+    let second = RamJournalThreadStore::new_with_policies(
+        "checkpoint-reader",
+        root,
+        1024 * 1024,
+        policy,
+    );
+    let cold = ThreadStore::load_latest_model_context(
+        &second,
+        LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("cold checkpoint recovery");
+    assert!(contains_terminal_turn(&cold.items, "turn-cp-3"));
+
+    let journal_state = second.journal_state(thread_id);
+    let state = journal_state.lock().await;
+    // turn 2 reset the schedule; turn 3 is one durable turn beyond it.
+    assert_eq!(state.turns_since_checkpoint, 1);
+    assert!(state.bytes_since_checkpoint > 0);
+}
+
+#[tokio::test]
+async fn checkpoint_can_be_triggered_by_durable_byte_distance() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let thread_id = ThreadId::new();
+    let store = RamJournalThreadStore::new_with_policies(
+        "checkpoint-bytes",
+        temp.path().to_path_buf(),
+        1024 * 1024,
+        CheckpointPolicy {
+            turn_interval: 0,
+            delta_bytes: 1,
+        },
+    );
+
+    ThreadStore::create_thread(&store, create_thread_params(thread_id))
+        .await
+        .expect("create resident thread");
+
+    ThreadStore::append_items(
+        &store,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal_turn("turn-bytes-1")],
+        },
+    )
+    .await
+    .expect("first turn should commit");
+    ThreadStore::append_items(
+        &store,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal_turn("turn-bytes-2")],
+        },
+    )
+    .await
+    .expect("second turn should checkpoint");
+
+    let frames = store.resident_histories.frames(thread_id);
+    assert_eq!(frames.len(), 2);
+    // Sequence 1 deliberately stays the bootstrap-only turn even under an
+    // absurdly tiny test threshold. The next durable turn carries the baseline.
+    assert!(!frames[0].has_checkpoint);
+    assert!(frames[1].has_checkpoint);
+
+    let journal_state = store.journal_state(thread_id);
+    let state = journal_state.lock().await;
+    assert_eq!(state.turns_since_checkpoint, 0);
+    assert_eq!(state.bytes_since_checkpoint, 0);
 }
 
 #[tokio::test]

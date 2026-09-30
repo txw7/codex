@@ -25,6 +25,7 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_queue_extension::QueuedItemService;
 use codex_rollout::state_db::StateDbHandle;
+use codex_state::ThreadGoalStore;
 
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
@@ -35,6 +36,7 @@ pub(crate) struct ThreadExtensionDependencies {
     pub(crate) event_sink: Arc<dyn ExtensionEventSink>,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) state_db: Option<StateDbHandle>,
+    pub(crate) goal_store: Option<Arc<dyn ThreadGoalStore>>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) thread_manager: Weak<ThreadManager>,
     pub(crate) goal_service: Arc<GoalService>,
@@ -54,6 +56,7 @@ pub(crate) fn thread_extensions(
         event_sink,
         auth_manager,
         state_db,
+        goal_store,
         analytics_events_client,
         thread_manager,
         goal_service,
@@ -73,9 +76,14 @@ pub(crate) fn thread_extensions(
     }
     codex_history_notes_extension::install(&mut builder, auth_manager.clone());
     codex_core::install_agent_message_board(&mut builder, thread_manager.clone());
-    if let Some(state_db) = state_db {
+    if let Some(goal_store) = goal_store {
+        // UPSTREAM-SEAM: goal installation follows goal-store availability,
+        // not SQLite availability. Local still supplies SQLite through the
+        // trait; RamJournal supplies RAM and may optionally retain StateRuntime
+        // only for presentation metadata.
         codex_goal_extension::install_with_backend(
             &mut builder,
+            goal_store,
             state_db,
             analytics_events_client,
             codex_otel::global(),

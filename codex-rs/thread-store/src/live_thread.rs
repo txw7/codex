@@ -230,6 +230,16 @@ impl LiveThread {
         })
     }
 
+    /// Whether terminal event delivery is gated on successful durable commit.
+    ///
+    /// UPSTREAM-SEAM: Session code asks the storage abstraction, not the
+    /// concrete backend type. Local/InMemory retain their existing failure
+    /// policy; RamJournal opts into the stronger receipt semantics.
+    pub fn requires_terminal_durability_before_delivery(&self) -> bool {
+        self.thread_store
+            .requires_terminal_durability_before_delivery()
+    }
+
     #[tracing::instrument(
         level = "trace",
         skip_all,

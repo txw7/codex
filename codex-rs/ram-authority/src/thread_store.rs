@@ -598,7 +598,7 @@ impl RamJournalThreadStore {
             None
         };
 
-        let frame = encode_turn_frame(
+        let ordinary_frame = encode_turn_frame(
             thread_id,
             &sealed.turn_id,
             sequence,
@@ -607,6 +607,35 @@ impl RamJournalThreadStore {
             &sealed.items,
         )
         .map_err(internal_error)?;
+
+        let checkpoint_due = sequence > 1
+            && self.checkpoint_policy.is_due(
+                state.turns_since_checkpoint,
+                state.bytes_since_checkpoint,
+                ordinary_frame.uncompressed_len,
+            );
+
+        let frame = if checkpoint_due {
+            // JOURNAL-NOTE: Build the replay baseline from already-resident
+            // committed frames plus this sealed turn. It rides inside this
+            // terminal frame, so checkpointing does not create a second write
+            // or a second durable object.
+            let checkpoint = self
+                .build_latest_model_context(thread_id, sealed.items.clone())
+                .await?;
+            encode_turn_frame_with_checkpoint(
+                thread_id,
+                &sealed.turn_id,
+                sequence,
+                state.last_digest,
+                bootstrap.as_ref(),
+                Some(&checkpoint),
+                &sealed.items,
+            )
+            .map_err(internal_error)?
+        } else {
+            ordinary_frame
+        };
 
         if state.commit_faulted {
             // JOURNAL-NOTE: A failed attempt can leave one of three things:
@@ -684,6 +713,7 @@ impl RamJournalThreadStore {
                         // recovery read from disk. A sync retry does not get to
                         // manufacture a second canonical compressed allocation
                         // merely because serialization is deterministic.
+                        Self::note_committed_frame(state, &recovered_frame);
                         self.resident_histories.push(thread_id, recovered_frame);
 
                         state
@@ -737,6 +767,7 @@ impl RamJournalThreadStore {
         // RESIDENCY-NOTE: The exact Arc-backed frame the writer just
         // acknowledged becomes canonical committed RAM history. There is no
         // reserialization step and no second compressed payload allocation.
+        Self::note_committed_frame(state, &resident_frame);
         self.resident_histories.push(thread_id, resident_frame);
 
         state

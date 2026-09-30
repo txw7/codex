@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -90,6 +91,7 @@ pub struct RamJournalThreadStore {
     bootstrap_params: Mutex<HashMap<ThreadId, CreateThreadParams>>,
     resident_histories: ResidentHistories,
     decoded_contexts: DecodedContextCache,
+    unloaded_threads: Mutex<HashSet<ThreadId>>,
 }
 
 impl RamJournalThreadStore {
@@ -115,6 +117,7 @@ impl RamJournalThreadStore {
             bootstrap_params: Mutex::new(HashMap::new()),
             resident_histories: ResidentHistories::default(),
             decoded_contexts: DecodedContextCache::new(decoded_context_budget_bytes),
+            unloaded_threads: Mutex::new(HashSet::new()),
         }
     }
 
@@ -134,6 +137,27 @@ impl RamJournalThreadStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains_key(&thread_id)
+    }
+
+    fn is_unloaded(&self, thread_id: ThreadId) -> bool {
+        self.unloaded_threads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&thread_id)
+    }
+
+    fn mark_loaded(&self, thread_id: ThreadId) {
+        self.unloaded_threads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&thread_id);
+    }
+
+    fn mark_unloaded(&self, thread_id: ThreadId) {
+        self.unloaded_threads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(thread_id);
     }
 
     async fn session_meta_line(&self, thread_id: ThreadId) -> ThreadStoreResult<SessionMetaLine> {

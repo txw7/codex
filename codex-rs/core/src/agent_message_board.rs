@@ -48,7 +48,7 @@ pub fn install_agent_message_board(
         move |config: &Config, tree, caller| {
             let in_memory = config.multi_agent_v2.message_board_in_memory
                 || matches!(
-                    config.experimental_thread_store,
+                    &config.experimental_thread_store,
                     ThreadStoreConfig::RamJournal { .. }
                 );
 

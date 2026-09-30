@@ -9,6 +9,7 @@ use codex_rollout::RolloutItem;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::CreateThreadParams;
 use codex_thread_store::ListThreadsParams;
+use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::PersistContext;
 use codex_thread_store::ReadThreadParams;
 use codex_thread_store::SortDirection;
@@ -72,6 +73,58 @@ fn contains_terminal_turn(items: &[RolloutItem], turn_id: &str) -> bool {
                 if event.turn_id == turn_id
         )
     })
+}
+
+#[tokio::test]
+async fn committed_turn_lives_compressed_not_in_the_delegate_transcript() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let thread_id = ThreadId::new();
+    let store = RamJournalThreadStore::new("compressed-authority", temp.path().to_path_buf());
+
+    ThreadStore::create_thread(&store, create_thread_params(thread_id))
+        .await
+        .expect("create resident thread");
+    ThreadStore::append_items(
+        &store,
+        AppendThreadItemsParams {
+            thread_id,
+            items: vec![terminal_turn("turn-compressed")],
+        },
+    )
+    .await
+    .expect("terminal turn should commit");
+
+    assert_eq!(store.resident_histories.frame_count(thread_id), 1);
+    assert!(store.resident_histories.compressed_bytes(thread_id) > 0);
+
+    let delegate_history = ThreadStore::load_history(
+        store.resident.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("delegate bootstrap history");
+
+    // FORK-INVARIANT: the delegate keeps SessionMeta for metadata/bootstrap
+    // semantics, not a second decoded copy of the committed transcript.
+    assert_eq!(delegate_history.items.len(), 1);
+    assert!(matches!(
+        delegate_history.items.first(),
+        Some(RolloutItem::SessionMeta(_))
+    ));
+
+    let canonical = ThreadStore::load_history(
+        &store,
+        LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("compressed canonical history should materialize");
+    assert!(contains_terminal_turn(&canonical.items, "turn-compressed"));
 }
 
 #[tokio::test]
@@ -185,6 +238,9 @@ async fn duplicate_terminal_retry_is_idempotent_after_cold_recovery() {
     .await
     .expect("cold recovery should rebuild committed terminal receipts");
 
+    let resident_frames_before_retry = second.resident_histories.frame_count(thread_id);
+    assert_eq!(resident_frames_before_retry, 1);
+
     ThreadStore::append_items(
         &second,
         AppendThreadItemsParams {
@@ -194,6 +250,13 @@ async fn duplicate_terminal_retry_is_idempotent_after_cold_recovery() {
     )
     .await
     .expect("identical terminal retry should be a no-op");
+
+    // RESIDENCY-NOTE: lost acknowledgement replay must not grow canonical RAM
+    // history any more than it grows the journal.
+    assert_eq!(
+        second.resident_histories.frame_count(thread_id),
+        resident_frames_before_retry
+    );
 
     assert_eq!(
         std::fs::metadata(&journal_path)

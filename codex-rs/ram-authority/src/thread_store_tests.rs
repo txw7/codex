@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::EventMsg;
@@ -12,6 +14,7 @@ use codex_thread_store::ListThreadsParams;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::PersistContext;
 use codex_thread_store::ReadThreadParams;
+use codex_thread_store::ResumeThreadParams;
 use codex_thread_store::SortDirection;
 use codex_thread_store::ThreadSortKey;
 use codex_thread_store::ThreadPersistenceMetadata;
@@ -73,6 +76,76 @@ fn contains_terminal_turn(items: &[RolloutItem], turn_id: &str) -> bool {
                 if event.turn_id == turn_id
         )
     })
+}
+
+#[tokio::test]
+async fn caller_supplied_legacy_history_remains_delegate_authority_without_cjr() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let thread_id = ThreadId::new();
+    let params = create_thread_params(thread_id);
+    let store = RamJournalThreadStore::new("legacy-compat", temp.path().to_path_buf());
+
+    // Model an already-existing compatibility thread without teaching
+    // RamJournal that it owns a CJR bootstrap for this identity.
+    ThreadStore::create_thread(store.resident.as_ref(), params.clone())
+        .await
+        .expect("create compatibility delegate thread");
+    let mut history = ThreadStore::load_history(
+        store.resident.as_ref(),
+        LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("read delegate bootstrap history")
+    .items;
+    history.push(terminal_turn("legacy-turn"));
+
+    ThreadStore::resume_thread(
+        &store,
+        ResumeThreadParams {
+            thread_id,
+            rollout_path: None,
+            history: Some(Arc::new(history)),
+            include_archived: true,
+            metadata: params.metadata.clone(),
+        },
+    )
+    .await
+    .expect("compatibility resume");
+
+    assert_eq!(store.resident_histories.frame_count(thread_id), 0);
+    assert!(!store.has_ram_journal_authority(thread_id));
+
+    let loaded = ThreadStore::load_history(
+        &store,
+        LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        },
+    )
+    .await
+    .expect("legacy delegate history must remain readable");
+    assert!(contains_terminal_turn(&loaded.items, "legacy-turn"));
+
+    // COMPAT-NOTE: no journal + no CJR bootstrap means the supplied history is
+    // still authority. Calling it RamJournal-owned because the config selected
+    // this store would be ontology by branding.
+    let thread = ThreadStore::read_thread(
+        &store,
+        ReadThreadParams {
+            thread_id,
+            include_archived: true,
+            include_history: true,
+        },
+    )
+    .await
+    .expect("legacy thread read");
+    assert!(contains_terminal_turn(
+        &thread.history.expect("legacy history").items,
+        "legacy-turn"
+    ));
 }
 
 #[tokio::test]

@@ -20,7 +20,7 @@ use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::EventMsg;
 use codex_rollout::RolloutItem;
-use codex_rollout::state_db::StateDbHandle;
+use codex_state::ThreadGoalStore;
 use codex_utils_path_uri::LegacyAppPathString;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -44,7 +44,7 @@ pub(crate) struct PendingThreadResumeRequest {
     pub(crate) instruction_sources: Vec<LegacyAppPathString>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,
     pub(crate) emit_thread_goal_update: bool,
-    pub(crate) thread_goal_state_db: Option<StateDbHandle>,
+    pub(crate) thread_goal_store: Option<Arc<dyn ThreadGoalStore>>,
     pub(crate) include_turns: bool,
     pub(crate) initial_turns_page:
         Option<codex_app_server_protocol::ThreadResumeInitialTurnsPageParams>,
@@ -78,7 +78,7 @@ pub(crate) enum ThreadListenerCommand {
     EmitThreadGoalCleared,
     // EmitThreadGoalSnapshot is used to read and emit the latest goal state in the listener order.
     EmitThreadGoalSnapshot {
-        state_db: StateDbHandle,
+        goal_store: Arc<dyn ThreadGoalStore>,
     },
     // ResolveServerRequest is used to notify the client that the request has been resolved.
     // It is executed in the thread listener's context to ensure that the resolved notification is ordered with regard to the request itself.

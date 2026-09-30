@@ -79,15 +79,21 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
+use codex_ram_authority::RamAgentGraphStore;
+use codex_ram_authority::RamGoalStore;
+use codex_ram_authority::RamQueueStore;
 use codex_ram_authority::build_bootstrap_thread_store;
 use codex_rollout::state_db::StateDbHandle;
+use codex_state::ThreadGoalStore;
 use codex_skills_extension::HostSkillsService;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::LocalQueueStore;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::MoveThreadToSectionParams;
 use codex_thread_store::PreparedFork;
+use codex_thread_store::QueueStore;
 use codex_thread_store::ReadThreadByRolloutPathParams;
 use codex_thread_store::ReadThreadParams;
 use codex_thread_store::StoredModelContext;
@@ -526,6 +532,62 @@ pub fn local_agent_graph_store_from_state_db(
     state_db.map(|state_db| {
         Arc::new(LocalAgentGraphStore::new(Arc::clone(state_db))) as Arc<dyn AgentGraphStore>
     })
+}
+
+/// Construct session-scoped auxiliary stores from the same backend selection
+/// that owns thread persistence.
+///
+/// UPSTREAM-SEAM: keep runtime-store composition here. App-server should consume
+/// storage-neutral traits rather than accumulating its own RamJournal match
+/// arms every time we evict another SQLite side authority.
+pub fn queue_store_from_config(
+    config: &Config,
+    state_db: Option<&StateDbHandle>,
+) -> Option<Arc<dyn QueueStore>> {
+    match &config.experimental_thread_store {
+        ThreadStoreConfig::Local => state_db.map(|state_db| {
+            Arc::new(LocalQueueStore::new(Arc::clone(state_db))) as Arc<dyn QueueStore>
+        }),
+        ThreadStoreConfig::RamJournal { .. } => {
+            // FORK-RAM: pending delivery is live scheduling state.
+            Some(Arc::new(RamQueueStore::default()))
+        }
+        ThreadStoreConfig::InMemory { .. } => None,
+    }
+}
+
+pub fn agent_graph_store_from_config(
+    config: &Config,
+    state_db: Option<&StateDbHandle>,
+) -> Option<Arc<dyn AgentGraphStore>> {
+    match &config.experimental_thread_store {
+        ThreadStoreConfig::Local => local_agent_graph_store_from_state_db(state_db),
+        ThreadStoreConfig::RamJournal { .. } => {
+            // FORK-RAM: graph topology is live RAM state; durable ancestry will
+            // come from journal lineage rather than a shadow SQLite monarchy.
+            Some(Arc::new(RamAgentGraphStore::default()))
+        }
+        ThreadStoreConfig::InMemory { .. } => None,
+    }
+}
+
+pub fn goal_store_from_config(
+    config: &Config,
+    state_db: Option<&StateDbHandle>,
+) -> Option<Arc<dyn ThreadGoalStore>> {
+    match &config.experimental_thread_store {
+        ThreadStoreConfig::Local => state_db.map(|state_db| {
+            Arc::new(state_db.thread_goals().clone()) as Arc<dyn ThreadGoalStore>
+        }),
+        ThreadStoreConfig::RamJournal { .. } => {
+            // FORK-RAM: live goal state follows the session authority into RAM.
+            //
+            // Goal changes still enter canonical rollout/journal history through
+            // ThreadGoalUpdated items. SQLite does not need a parallel vote.
+            Some(Arc::new(RamGoalStore::default()))
+        }
+        ThreadStoreConfig::InMemory { .. } => None,
+    }
 }
 
 impl ThreadManager {

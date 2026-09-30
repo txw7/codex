@@ -611,6 +611,100 @@ RETURNING
     }
 }
 
+impl crate::ThreadGoalStore for GoalStore {
+    fn get_thread_goal(
+        &self,
+        thread_id: ThreadId,
+    ) -> crate::ThreadGoalStoreFuture<'_, Option<crate::ThreadGoal>> {
+        Box::pin(async move { GoalStore::get_thread_goal(self, thread_id).await })
+    }
+
+    fn replace_thread_goal_snapshot<'a>(
+        &'a self,
+        goal: &'a crate::ThreadGoal,
+    ) -> crate::ThreadGoalStoreFuture<'a, ()> {
+        Box::pin(async move { GoalStore::replace_thread_goal_snapshot(self, goal).await })
+    }
+
+    fn has_thread_goal_continuation_deferral(
+        &self,
+        thread_id: ThreadId,
+    ) -> crate::ThreadGoalStoreFuture<'_, bool> {
+        Box::pin(async move {
+            GoalStore::has_thread_goal_continuation_deferral(self, thread_id).await
+        })
+    }
+
+    fn clear_thread_goal_continuation_deferral(
+        &self,
+        thread_id: ThreadId,
+    ) -> crate::ThreadGoalStoreFuture<'_, ()> {
+        Box::pin(async move {
+            GoalStore::clear_thread_goal_continuation_deferral(self, thread_id).await
+        })
+    }
+
+    fn replace_thread_goal<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        objective: &'a str,
+        status: crate::ThreadGoalStatus,
+        token_budget: Option<i64>,
+    ) -> crate::ThreadGoalStoreFuture<'a, crate::ThreadGoal> {
+        Box::pin(async move {
+            GoalStore::replace_thread_goal(self, thread_id, objective, status, token_budget).await
+        })
+    }
+
+    fn insert_thread_goal<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        objective: &'a str,
+        status: crate::ThreadGoalStatus,
+        token_budget: Option<i64>,
+    ) -> crate::ThreadGoalStoreFuture<'a, Option<crate::ThreadGoal>> {
+        Box::pin(async move {
+            GoalStore::insert_thread_goal(self, thread_id, objective, status, token_budget).await
+        })
+    }
+
+    fn update_thread_goal(
+        &self,
+        thread_id: ThreadId,
+        update: GoalUpdate,
+    ) -> crate::ThreadGoalStoreFuture<'_, Option<crate::ThreadGoal>> {
+        Box::pin(async move { GoalStore::update_thread_goal(self, thread_id, update).await })
+    }
+
+    fn delete_thread_goal(
+        &self,
+        thread_id: ThreadId,
+    ) -> crate::ThreadGoalStoreFuture<'_, Option<crate::ThreadGoal>> {
+        Box::pin(async move { GoalStore::delete_thread_goal(self, thread_id).await })
+    }
+
+    fn account_thread_goal_usage<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        time_delta_seconds: i64,
+        token_delta: i64,
+        mode: GoalAccountingMode,
+        expected_goal_id: Option<&'a str>,
+    ) -> crate::ThreadGoalStoreFuture<'a, GoalAccountingOutcome> {
+        Box::pin(async move {
+            GoalStore::account_thread_goal_usage(
+                self,
+                thread_id,
+                time_delta_seconds,
+                token_delta,
+                mode,
+                expected_goal_id,
+            )
+            .await
+        })
+    }
+}
+
 fn thread_goal_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<crate::ThreadGoal> {
     ThreadGoalRow::try_from_row(row).and_then(crate::ThreadGoal::try_from)
 }

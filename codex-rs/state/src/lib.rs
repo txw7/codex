@@ -18,6 +18,7 @@ mod paths;
 mod runtime;
 mod sqlite;
 mod telemetry;
+mod thread_goal_store;
 
 pub use log_db::LogWriteFailureReporter;
 pub use model::CreatedProject;
@@ -94,6 +95,8 @@ pub use runtime::sqlite_error_detail_is_corruption;
 pub use runtime::sqlite_error_detail_is_lock;
 pub use runtime::sqlite_integrity_check;
 pub use sqlite::RuntimeDbPath;
+pub use thread_goal_store::ThreadGoalStore;
+pub use thread_goal_store::ThreadGoalStoreFuture;
 pub use telemetry::DbTelemetry;
 pub use telemetry::DbTelemetryHandle;
 pub use telemetry::install_process_db_telemetry;

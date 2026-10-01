@@ -917,24 +917,7 @@ impl ThreadStore for RamJournalThreadStore {
                 return Ok(Arc::new(context.items));
             }
 
-            ThreadStore::resume_thread(
-                self.resident.as_ref(),
-                ResumeThreadParams {
-                    thread_id,
-                    rollout_path: None,
-                    history: None,
-                    history_revision: None,
-                    include_archived: true,
-                    metadata: self
-                        .bootstrap_params
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .get(&thread_id)
-                        .map(|params| params.metadata.clone())
-                        .unwrap_or_else(|| resident_params.metadata.clone()),
-                },
-            )
-            .await
+            Ok(_delegate_history)
         })
     }
 

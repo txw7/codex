@@ -37,6 +37,7 @@ use crate::journal::JournalWriter;
 use crate::journal::encode_turn_frame;
 use crate::pending_turn::PendingTurn;
 use crate::pending_turn::terminal_event_identity;
+use crate::revision::ResidentRevisionV1;
 
 #[derive(Debug)]
 struct ThreadJournalState {
@@ -99,6 +100,26 @@ impl RamJournalThreadStore {
             .entry(thread_id)
             .or_insert_with(|| Arc::new(AsyncMutex::new(ThreadJournalState::default())))
             .clone()
+    }
+
+    fn known_journal_state(&self, thread_id: ThreadId) -> Option<Arc<AsyncMutex<ThreadJournalState>>> {
+        self.journal_states
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&thread_id)
+            .cloned()
+    }
+
+    async fn resident_revision(&self, thread_id: ThreadId) -> Option<String> {
+        let state = self.known_journal_state(thread_id)?;
+        let state = state.lock().await;
+        let durable_head_digest = state.last_digest?;
+        let durable_sequence = state.next_sequence.checked_sub(1)?;
+
+        Some(
+            ResidentRevisionV1::new(durable_sequence, durable_head_digest)
+                .to_opaque_string(),
+        )
     }
 
     async fn hydrate_from_journal(&self, thread_id: ThreadId) -> ThreadStoreResult<bool> {
@@ -414,25 +435,38 @@ impl ThreadStore for RamJournalThreadStore {
         })
     }
 
-    fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
-        let thread_id = params.thread_id.clone();
+    fn resume_thread(
+        &self,
+        params: ResumeThreadParams,
+    ) -> ThreadStoreFuture<'_, Arc<Vec<RolloutItem>>> {
+        let thread_id = params.thread_id;
         let history_mode = params
             .history
             .as_deref()
             .and_then(history_mode_from_items)
             .unwrap_or_default();
+
         Box::pin(async move {
-            if params.history.is_none() {
-                let _ = self.hydrate_from_journal(thread_id.clone()).await?;
+            // AUTHORITY-NOTE: If a previous read already hydrated this thread,
+            // resume performs no journal read. Otherwise cold resume verifies
+            // and installs the durable journal before publishing canonical
+            // replay history under live ownership.
+            //
+            // Canonical supplied snapshots therefore cannot overwrite a newer
+            // journal head. Headerless explicit overrides retain upstream's
+            // existing import semantics inside InMemoryThreadStore.
+            if self.known_journal_state(thread_id).is_none() {
+                let _ = self.hydrate_from_journal(thread_id).await?;
             }
 
-            ThreadStore::resume_thread(self.resident.as_ref(), params).await?;
+            let history = ThreadStore::resume_thread(self.resident.as_ref(), params).await?;
             self.history_modes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .entry(thread_id)
                 .or_insert(history_mode);
-            Ok(())
+
+            Ok(history)
         })
     }
 
@@ -564,19 +598,24 @@ impl ThreadStore for RamJournalThreadStore {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredThreadHistory> {
         Box::pin(async move {
-            match ThreadStore::load_history(self.resident.as_ref(), params.clone()).await {
-                Ok(history) => Ok(history),
-                Err(ThreadStoreError::ThreadNotFound { .. }) => {
-                    if self.hydrate_from_journal(params.thread_id.clone()).await? {
-                        ThreadStore::load_history(self.resident.as_ref(), params).await
-                    } else {
-                        Err(ThreadStoreError::ThreadNotFound {
-                            thread_id: params.thread_id,
-                        })
+            let thread_id = params.thread_id;
+            let mut history =
+                match ThreadStore::load_history(self.resident.as_ref(), params.clone()).await {
+                    Ok(history) => history,
+                    Err(ThreadStoreError::ThreadNotFound { .. }) => {
+                        if self.hydrate_from_journal(thread_id).await? {
+                            ThreadStore::load_history(self.resident.as_ref(), params).await?
+                        } else {
+                            return Err(ThreadStoreError::ThreadNotFound { thread_id });
+                        }
                     }
-                }
-                Err(error) => Err(error),
-            }
+                    Err(error) => return Err(error),
+                };
+
+            // FORK-RAM: upstream's revision slot now carries semantic journal
+            // freshness. No pathname, inode, or mtime is invited to vote.
+            history.revision = self.resident_revision(thread_id).await;
+            Ok(history)
         })
     }
 
@@ -585,38 +624,47 @@ impl ThreadStore for RamJournalThreadStore {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
         Box::pin(async move {
-            match ThreadStore::load_latest_model_context(self.resident.as_ref(), params.clone()).await
-            {
-                Ok(context) => Ok(context),
-                Err(ThreadStoreError::ThreadNotFound { .. }) => {
-                    if self.hydrate_from_journal(params.thread_id.clone()).await? {
-                        ThreadStore::load_latest_model_context(self.resident.as_ref(), params).await
-                    } else {
-                        Err(ThreadStoreError::ThreadNotFound {
-                            thread_id: params.thread_id,
-                        })
+            let thread_id = params.thread_id;
+            let mut context =
+                match ThreadStore::load_latest_model_context(self.resident.as_ref(), params.clone())
+                    .await
+                {
+                    Ok(context) => context,
+                    Err(ThreadStoreError::ThreadNotFound { .. }) => {
+                        if self.hydrate_from_journal(thread_id).await? {
+                            ThreadStore::load_latest_model_context(self.resident.as_ref(), params)
+                                .await?
+                        } else {
+                            return Err(ThreadStoreError::ThreadNotFound { thread_id });
+                        }
                     }
-                }
-                Err(error) => Err(error),
-            }
+                    Err(error) => return Err(error),
+                };
+
+            context.revision = self.resident_revision(thread_id).await;
+            Ok(context)
         })
     }
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
         Box::pin(async move {
-            match ThreadStore::read_thread(self.resident.as_ref(), params.clone()).await {
-                Ok(thread) => Ok(thread),
+            let thread_id = params.thread_id;
+            let mut thread = match ThreadStore::read_thread(self.resident.as_ref(), params.clone()).await {
+                Ok(thread) => thread,
                 Err(ThreadStoreError::ThreadNotFound { .. }) => {
-                    if self.hydrate_from_journal(params.thread_id.clone()).await? {
-                        ThreadStore::read_thread(self.resident.as_ref(), params).await
+                    if self.hydrate_from_journal(thread_id).await? {
+                        ThreadStore::read_thread(self.resident.as_ref(), params).await?
                     } else {
-                        Err(ThreadStoreError::ThreadNotFound {
-                            thread_id: params.thread_id,
-                        })
+                        return Err(ThreadStoreError::ThreadNotFound { thread_id });
                     }
                 }
-                Err(error) => Err(error),
+                Err(error) => return Err(error),
+            };
+
+            if let Some(history) = thread.history.as_mut() {
+                history.revision = self.resident_revision(thread_id).await;
             }
+            Ok(thread)
         })
     }
 

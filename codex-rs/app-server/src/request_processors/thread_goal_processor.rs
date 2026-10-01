@@ -214,7 +214,7 @@ impl ThreadGoalRequestProcessor {
 
         let outcome = self
             .goal_service
-            .set_thread_goal(
+            .set_thread_goal_with_preview(
                 goal_store.as_ref(),
                 preview_state_db.as_deref(),
                 GoalSetRequest {

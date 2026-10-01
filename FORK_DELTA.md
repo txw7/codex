@@ -76,6 +76,36 @@ This is a proof scaffold, not the final representation.
 The next phase replaces expanded resident history with `PendingTurnV1` plus terminal CJR commits. Until that work lands, any comment claiming one-turn-one-append would be marketing, and this fork has enough maintenance obligations without maintaining fictional accomplishments.
 
 
+### RAM-TS-004
+
+Upstream symbol: `codex_thread_store::ThreadStore`
+
+Fork behavior: wraps the complete current trait surface in `RamJournalThreadStore` and evolves journal semantics behind that owned type.
+
+Reason: core sees one fork-owned production backend identity while storage physics change behind the maintained seam.
+
+Fork implementation: `codex-rs/ram-authority/src/thread_store.rs`
+
+Merge rule: when upstream adds or changes ThreadStore methods, update the wrapper deliberately. Do not allow a new upstream capability to disappear because the fork wrapper forgot it exists.
+
+Test expectation: RamJournal resolves to `RamJournalThreadStore`; Local and InMemory remain independent upstream backends.
+
+
+### RAM-TS-005
+
+Upstream symbol: `ThreadStore::resume_thread` and snapshot revision fields on `ResumeThreadParams`, `StoredThreadHistory`, and `StoredModelContext`
+
+Fork behavior: preserve upstream's authoritative-resume contract, but validate RamJournal snapshots with `ResidentRevisionV1 { durable_sequence, durable_head_digest }`.
+
+Reason: cold-loaded state may become stale before live ownership is established. The live authority must publish a replay view proven current against the journal head.
+
+Fork implementation: `codex-rs/ram-authority/src/revision.rs` and `thread_store.rs`
+
+Merge rule: if upstream changes snapshot-validation semantics again, preserve the semantic requirement first. Do not inherit LocalThreadStore's filesystem-derived revision encoding unless the journal somehow develops an inode-based personality.
+
+Test expectation: RamJournal revisions round-trip through the opaque upstream slot; foreign revision namespaces are rejected and force canonical reload.
+
+
 ## Phase 02 terminal journal status
 
 RamJournal now owns an actual terminal-turn durability edge.
@@ -116,7 +146,7 @@ Explicitly **not** claimed yet:
 The final bullet is deliberately boring and therefore important. A test existing in source is not the same thing as a test having run. This fork is already opinionated enough without becoming metaphysical about CI receipts.
 
 
-### RAM-TS-005
+### RAM-TS-006
 
 Upstream symbols:
 - `codex_thread_store::ThreadStore::requires_terminal_durability_before_delivery`

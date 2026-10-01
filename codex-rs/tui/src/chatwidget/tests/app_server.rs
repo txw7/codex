@@ -625,6 +625,8 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
     let mut session = configured_thread_session(thread_id);
     session.cwd = test_path_buf("/tmp/original-workspace").abs();
     chat.handle_thread_session(session);
+    chat.config.permissions.approval_policy =
+        Constrained::allow_only(AskForApproval::Never.to_core());
     let previous_generation = chat.connector_scope_generation();
     let old_app = serde_json::from_str(r#"{"id":"old","name":"Old","isAccessible":true}"#)
         .expect("valid app");
@@ -1111,6 +1113,28 @@ async fn config_warning_during_turn_retains_transcript_details() {
     let cells = drain_insert_history_transcript(&mut rx);
     insta::assert_snapshot!(
         "runtime_config_warning",
+        cells
+            .iter()
+            .map(|lines| lines_to_single_string(lines))
+            .collect::<String>()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_recovery_warning_shows_backup_and_metadata_limitations() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.handle_server_notification(
+        ServerNotification::ConfigWarning(ConfigWarningNotification {
+            summary: "Codex rebuilt its local database".into(),
+            details: Some("Damaged local databases were rebuilt. Saved conversations remain in rollout files and can restore the thread list and history. Some database-only metadata may be unavailable. The original database files were preserved at the backup locations below.\n\nDatabase path: /codex/state_5.sqlite\nBackup folder: /codex/db-backups/recovery".into()),
+            path: None,
+            range: None,
+        }),
+        /*replay_kind*/ None,
+    );
+    let cells = drain_insert_history_transcript(&mut rx);
+    insta::assert_snapshot!(
+        "sqlite_recovery_warning",
         cells
             .iter()
             .map(|lines| lines_to_single_string(lines))

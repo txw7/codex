@@ -46,6 +46,7 @@ use crate::journal::encode_turn_frame_with_checkpoint;
 use crate::pending_turn::PendingTurn;
 use crate::pending_turn::terminal_event_identity;
 use crate::resident_history::ResidentHistories;
+use crate::revision::ResidentRevisionV1;
 
 // RESIDENCY-NOTE: This is a provisional fork default, not sacred geometry.
 // The cache is byte-bounded today; Phase 03/06 telemetry and deployment config
@@ -235,6 +236,18 @@ impl RamJournalThreadStore {
             .cloned()
     }
 
+    async fn resident_revision(&self, thread_id: ThreadId) -> Option<String> {
+        let state = self.existing_journal_state(thread_id)?;
+        let state = state.lock().await;
+        let durable_head_digest = state.last_digest?;
+        let durable_sequence = state.next_sequence.checked_sub(1)?;
+
+        Some(
+            ResidentRevisionV1::new(durable_sequence, durable_head_digest)
+                .to_opaque_string(),
+        )
+    }
+
     fn release_heavy_residency(&self, thread_id: ThreadId) {
         self.resident_histories.remove(thread_id);
         self.decoded_contexts.invalidate(thread_id);
@@ -325,7 +338,11 @@ impl RamJournalThreadStore {
         items.extend(self.decode_resident_frames(thread_id)?);
         items.extend(self.pending_items(thread_id).await);
 
-        Ok(StoredThreadHistory { thread_id, items })
+        Ok(StoredThreadHistory {
+            thread_id,
+            items,
+            revision: self.resident_revision(thread_id).await,
+        })
     }
 
     async fn build_latest_model_context(
@@ -392,7 +409,11 @@ impl RamJournalThreadStore {
                 items.extend(decoded.items);
             }
             items.extend(pending_items);
-            return Ok(StoredModelContext { thread_id, items });
+            return Ok(StoredModelContext {
+                thread_id,
+                items,
+                revision: self.resident_revision(thread_id).await,
+            });
         }
 
         let session_meta = self.session_meta_line(thread_id).await?;
@@ -425,7 +446,11 @@ impl RamJournalThreadStore {
 
         let mut items = scan.finish();
         items.insert(0, RolloutItem::SessionMeta(session_meta));
-        Ok(StoredModelContext { thread_id, items })
+        Ok(StoredModelContext {
+            thread_id,
+            items,
+            revision: self.resident_revision(thread_id).await,
+        })
     }
 
     async fn materialize_latest_model_context(
@@ -840,7 +865,10 @@ impl ThreadStore for RamJournalThreadStore {
         })
     }
 
-    fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
+    fn resume_thread(
+        &self,
+        params: ResumeThreadParams,
+    ) -> ThreadStoreFuture<'_, Arc<Vec<RolloutItem>>> {
         let thread_id = params.thread_id;
         let history_mode = params
             .history
@@ -871,14 +899,42 @@ impl ThreadStore for RamJournalThreadStore {
                 resident_params.history = None;
             }
 
-            ThreadStore::resume_thread(self.resident.as_ref(), resident_params).await?;
+            let _delegate_history =
+                ThreadStore::resume_thread(self.resident.as_ref(), resident_params).await?;
             self.mark_loaded(thread_id);
             self.history_modes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .entry(thread_id)
                 .or_insert(history_mode);
-            Ok(())
+
+            // AUTHORITY-NOTE: The replay Arc published to core is reconstructed
+            // from the canonical resident authority after ownership is acquired.
+            // The delegate exists for upstream metadata semantics; compressed
+            // CJR frames remain the transcript authority when present.
+            if self.has_ram_journal_authority(thread_id) {
+                let context = self.materialize_latest_model_context(thread_id).await?;
+                return Ok(Arc::new(context.items));
+            }
+
+            ThreadStore::resume_thread(
+                self.resident.as_ref(),
+                ResumeThreadParams {
+                    thread_id,
+                    rollout_path: None,
+                    history: None,
+                    history_revision: None,
+                    include_archived: true,
+                    metadata: self
+                        .bootstrap_params
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .get(&thread_id)
+                        .map(|params| params.metadata.clone())
+                        .unwrap_or_else(|| resident_params.metadata.clone()),
+                },
+            )
+            .await
         })
     }
 

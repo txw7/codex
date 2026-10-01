@@ -713,6 +713,9 @@
             "analytics_plan_history": {
               "type": "boolean"
             },
+            "api_key_cyber_access_programs": {
+              "type": "boolean"
+            },
             "api_key_model_discovery": {
               "type": "boolean"
             },
@@ -936,6 +939,9 @@
             "in_app_updates": {
               "type": "boolean"
             },
+            "in_app_voice": {
+              "type": "boolean"
+            },
             "instant_interrupt": {
               "type": "boolean"
             },
@@ -954,6 +960,9 @@
             "local_thread_store_shared_compression": {
               "type": "boolean"
             },
+            "login_shell_package_path": {
+              "type": "boolean"
+            },
             "mcp_2026_07_28": {
               "type": "boolean"
             },
@@ -967,6 +976,9 @@
               "type": "boolean"
             },
             "mentions_v2": {
+              "type": "boolean"
+            },
+            "model_catalog_in_context": {
               "type": "boolean"
             },
             "multi_agent": {
@@ -4429,6 +4441,7 @@
             "agents": {
               "archive": null,
               "delete": null,
+              "fork": null,
               "hide": null,
               "new_task": null,
               "new_worktree": null,
@@ -4782,6 +4795,14 @@
             }
           ],
           "description": "Permanently delete the selected task and its child agents after confirmation."
+        },
+        "fork": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Fork the selected conversation and open the new session."
         },
         "hide": {
           "allOf": [
@@ -5367,6 +5388,7 @@
           "default": {
             "archive": null,
             "delete": null,
+            "fork": null,
             "hide": null,
             "new_task": null,
             "new_worktree": null,
@@ -6737,6 +6759,9 @@
         "analytics_plan_history": {
           "type": "boolean"
         },
+        "api_key_cyber_access_programs": {
+          "type": "boolean"
+        },
         "api_key_model_discovery": {
           "type": "boolean"
         },
@@ -6960,6 +6985,9 @@
         "in_app_updates": {
           "type": "boolean"
         },
+        "in_app_voice": {
+          "type": "boolean"
+        },
         "instant_interrupt": {
           "type": "boolean"
         },
@@ -6978,6 +7006,9 @@
         "local_thread_store_shared_compression": {
           "type": "boolean"
         },
+        "login_shell_package_path": {
+          "type": "boolean"
+        },
         "mcp_2026_07_28": {
           "type": "boolean"
         },
@@ -6991,6 +7022,9 @@
           "type": "boolean"
         },
         "mentions_v2": {
+          "type": "boolean"
+        },
+        "model_catalog_in_context": {
           "type": "boolean"
         },
         "multi_agent": {

@@ -1504,6 +1504,7 @@ impl ThreadManager {
         prepared: PreparedFork,
     ) -> CodexResult<NewThread> {
         let history = InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: prepared.source_thread_id,
             history: Arc::clone(&prepared.model_context),
             rollout_path: None,
@@ -2478,6 +2479,7 @@ fn stored_thread_to_initial_history(
         ))
     })?;
     Ok(InitialHistory::Resumed(ResumedHistory {
+        history_revision: history.revision,
         conversation_id: thread_id,
         history: Arc::new(history.items),
         rollout_path: rollout_path.or(stored_thread.rollout_path),

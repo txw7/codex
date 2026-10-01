@@ -146,6 +146,25 @@ impl GoalService {
     pub async fn set_thread_goal(
         &self,
         goal_store: &dyn codex_state::ThreadGoalStore,
+        request: GoalSetRequest<'_>,
+        record_user_instruction: impl Future<Output = Result<(), GoalServiceError>> + Send,
+    ) -> Result<GoalSetOutcome, GoalServiceError> {
+        self.set_thread_goal_with_preview(
+            goal_store,
+            /*preview_state_db*/ None,
+            request,
+            record_user_instruction,
+        )
+        .await
+    }
+
+    /// Storage-neutral goal mutation with optional Local-only preview metadata.
+    ///
+    /// SQLITE-NOTE: preview_state_db may update display text. It has no vote in
+    /// whether the goal exists or whether the mutation succeeds.
+    pub async fn set_thread_goal_with_preview(
+        &self,
+        goal_store: &dyn codex_state::ThreadGoalStore,
         preview_state_db: Option<&codex_state::StateRuntime>,
         request: GoalSetRequest<'_>,
         record_user_instruction: impl Future<Output = Result<(), GoalServiceError>> + Send,

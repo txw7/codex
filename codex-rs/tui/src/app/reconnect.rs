@@ -327,8 +327,13 @@ impl App {
         self.pending_app_server_requests.clear();
         // The displayed task was resumed above. Keep offscreen selections pending until those
         // tasks can be resumed from the server too; their old confirmations cannot arrive.
-        let pending_displayed_profile =
-            displayed.and_then(|id| self.pending_server_profiles.remove(&id));
+        let pending_displayed_profile = displayed.and_then(|id| {
+            self.pending_server_profiles.remove(&id).or_else(|| {
+                self.agents_overview
+                    .requested_permission_profiles
+                    .remove(&id)
+            })
+        });
         if let Some(selection) = &pending_displayed_profile {
             self.runtime_approval_policy_override = None;
             if selection.approvals_reviewer.is_some() {
@@ -479,6 +484,12 @@ impl App {
             matches!(bootstrap.auth_mode, Some(TelemetryAuthMode::Chatgpt)),
         );
         if self.chat_widget.has_chatgpt_account() {
+            crate::security_setup::prefetch(
+                &self.config,
+                app_server,
+                self.app_event_tx.clone(),
+                self.chat_widget.security_setup_request_id,
+            );
             crate::daybreak::prefetch_notice(
                 &self.config,
                 app_server,

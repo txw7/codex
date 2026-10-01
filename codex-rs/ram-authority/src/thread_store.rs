@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use codex_rollout::RolloutItem;
 use codex_thread_store::*;
 
 /// Phase-01 fork-owned thread-store identity.
@@ -73,7 +74,20 @@ impl ThreadStore for RamJournalThreadStore {
         self.inner.remove_pending_thread_metadata(thread_id)
     }
 
-    fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
+    fn resume_thread(
+        &self,
+        params: ResumeThreadParams,
+    ) -> ThreadStoreFuture<'_, Arc<Vec<RolloutItem>>> {
+        // AUTHORITY-NOTE: Upstream now requires resume to return the replay
+        // history observed under writer ownership.
+        //
+        // This is exactly the right semantic boundary for RamJournal: cold state
+        // may be inspected before ownership, but the live authority must publish
+        // the canonical replay view *after* it owns mutation ordering.
+        //
+        // Phase 01 delegates that contract to InMemoryThreadStore. Phase 02
+        // replaces the validation source with our durable journal head instead
+        // of filesystem revision folklore.
         self.inner.resume_thread(params)
     }
 

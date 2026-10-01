@@ -5,12 +5,15 @@
 //! Later phases replace that representation behind this crate boundary with
 //! compressed resident frames and terminal-turn journal commits.
 
+mod revision;
 mod thread_store;
 
 use std::sync::Arc;
 
 use codex_thread_store::ThreadStore;
 
+pub use revision::ResidentRevisionParseError;
+pub use revision::ResidentRevisionV1;
 pub use thread_store::RamJournalThreadStore;
 
 /// Build the Phase 01 RamJournal backend.

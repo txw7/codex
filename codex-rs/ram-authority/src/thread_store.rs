@@ -384,6 +384,7 @@ impl RamJournalThreadStore {
                 context.items.extend(decoded.items);
             }
             context.items.extend(pending_items);
+            context.revision = self.resident_revision(thread_id).await;
             return Ok(context);
         }
 

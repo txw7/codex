@@ -490,6 +490,7 @@ impl App {
     /// This helper copies every known nickname/role from `AgentNavigationState` into the
     /// replacement widget so that replayed collab items render agent names immediately.
     pub(super) fn replace_chat_widget(&mut self, mut chat_widget: ChatWidget) {
+        chat_widget.fork_in_progress = self.chat_widget.fork_in_progress;
         self.pending_right_click_paste = None;
         if !self.chat_widget.realtime_conversation_is_running() {
             self.retain_realtime_replay_state_before_replace();
@@ -519,6 +520,7 @@ impl App {
             AppServerTarget::LocalDaemon { .. }
         ));
         chat_widget.inherit_backend_banner_state(&mut self.chat_widget);
+        chat_widget.inherit_security_setup(&mut self.chat_widget);
         for (thread_id, entry) in self.agent_navigation.ordered_threads() {
             chat_widget.set_collab_agent_metadata(
                 thread_id,
@@ -757,6 +759,20 @@ impl App {
         self.app_event_tx
             .send(AppEvent::ResetTranscriptForThreadSwitch);
         self.replay_thread_snapshot(snapshot, resume_restored_queue);
+        if let Some(thread_id) = self.chat_widget.thread_id()
+            && let Some(active) = self
+                .chat_widget
+                .config_ref()
+                .permissions
+                .active_permission_profile()
+            && self
+                .agents_overview
+                .selected_permission_profiles
+                .get(&thread_id)
+                == Some(&active.id)
+        {
+            self.adopt_server_permissions();
+        }
         if external_writer {
             self.chat_widget.show_external_writer_thread();
         }
@@ -1108,7 +1124,7 @@ impl App {
             ThreadAttachPresentation::Fresh | ThreadAttachPresentation::FreshWithDraft
         ) {
             self.chat_widget.mark_fresh_task_for_sparkle(&started);
-            // FreshWithDraft inherits its provisional greeting and replay at the handoff.
+            // FreshWithDraft inherits its provisional replay at the handoff.
             if matches!(presentation, ThreadAttachPresentation::Fresh) {
                 self.chat_widget
                     .empty_state_animation

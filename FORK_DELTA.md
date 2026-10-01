@@ -166,3 +166,71 @@ Tests/receipts:
 - Local/InMemory retain the default non-strict policy.
 
 Snark note: "completed, except the part where persistence failed" is not a useful terminal state.
+
+## Phase 03 compressed residency status
+
+RamJournal now separates canonical committed history from decoded working state.
+
+Implemented:
+
+- committed turns remain as independently compressed CJR frames in `ResidentHistories`;
+- successful live commits promote the exact Arc-backed frame handed to the writer into resident canonical history;
+- cold hydration installs verified compressed frames without expanding the committed transcript into `InMemoryThreadStore`;
+- open-turn persisted items remain in `PendingTurn`;
+- complete-history APIs explicitly decode response values without changing canonical residency;
+- latest-model-context reads use a byte-bounded LRU decoded cache;
+- paginated model-context reconstruction scans compressed frames newest-to-oldest and stops when upstream `ModelContextScan` is complete;
+- checkpoint baselines ride inside ordinary terminal frames instead of creating extra writes;
+- checkpoint cadence is currently 32 turns or 16 MiB of uncheckpointed logical payload, whichever arrives first;
+- idle shutdown refuses open turns, unresolved journal faults, and resident/durable head mismatch;
+- durable idle threads release compressed frames + decoded hot cache and become explicitly unloaded;
+- a later history/context read performs one cold hydration and returns to disk-independent loaded behavior;
+- `thread/list` performs cold journal discovery once per process and then reuses a rebuildable resident catalog;
+- catalog state remains a projection, never canonical history.
+
+### RAM-RES-001
+
+Fork implementation:
+- `codex-rs/ram-authority/src/resident_history.rs`
+- `codex-rs/ram-authority/src/decoded_context_cache.rs`
+- `codex-rs/ram-authority/src/catalog.rs`
+
+Invariant:
+
+`LOADED => complete committed logical history available from compressed RAM frames`
+
+Decoded context may be evicted independently. Compressed committed history may not disappear while the thread remains loaded.
+
+### RAM-RES-002
+
+Upstream seam: `ThreadStore::shutdown_thread`
+
+Fork behavior: RamJournal treats shutdown of a durable idle thread as the whole-thread unload boundary.
+
+Eviction preconditions include:
+
+- no open pending turn;
+- no unresolved terminal commit fault;
+- resident committed head digest equals acknowledged durable head digest.
+
+Merge rule: if upstream changes the semantics of thread unload/shutdown, review this boundary before merging. Do not quietly turn `shutdown_thread` into "close some handles, probably" while the fork relies on it as the T3 -> T4 transition.
+
+### RAM-RES-003
+
+Upstream seam: `ThreadStore::list_threads`
+
+Fork behavior: the first cold listing may discover CJR journal placement; subsequent ordinary listing uses the process-resident catalog and retained lightweight metadata.
+
+Reason: sidebar refresh is not a storage recovery protocol.
+
+Receipt: after first discovery, the test replaces the journal `v1` directory with a regular file. A second list must still succeed from RAM; old per-call discovery would fail with `NotADirectory`.
+
+Explicitly not claimed yet:
+
+- process-wide compressed-resident memory budget / LRU admission across many threads;
+- memfd arena backing;
+- strict swap policy;
+- RAM replacements for queue / graph / goal / session-log SQLite services;
+- multi-process authority fencing and Factory/Bifrost routing.
+
+Those are later phases. Phase 03 makes one loaded thread's history representation honest before we start governing the rest of the process.

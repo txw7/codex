@@ -1,41 +1,405 @@
 use std::any::Any;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 
+use codex_protocol::ThreadId;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutItem;
-use codex_thread_store::*;
+use codex_rollout::persisted_rollout_items;
+use codex_thread_store::AppendThreadItemsParams;
+use codex_thread_store::ArchiveThreadParams;
+use codex_thread_store::CreateThreadParams;
+use codex_thread_store::DeleteThreadParams;
+use codex_thread_store::InMemoryThreadStore;
+use codex_thread_store::ListThreadsParams;
+use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::MoveThreadToSectionParams;
+use codex_thread_store::PersistContext;
+use codex_thread_store::ReadThreadByRolloutPathParams;
+use codex_thread_store::ReadThreadParams;
+use codex_thread_store::ResumeThreadParams;
+use codex_thread_store::StoredModelContext;
+use codex_thread_store::StoredThread;
+use codex_thread_store::StoredThreadHistory;
+use codex_thread_store::ThreadPage;
+use codex_thread_store::ThreadStore;
+use codex_thread_store::ThreadStoreError;
+use codex_thread_store::ThreadStoreFuture;
+use codex_thread_store::ThreadStoreResult;
+use codex_thread_store::UpdateThreadMetadataParams;
+use tokio::sync::Mutex as AsyncMutex;
 
-/// Phase-01 fork-owned thread-store identity.
+use crate::journal::JournalReader;
+use crate::journal::JournalWriter;
+use crate::journal::encode_turn_frame;
+use crate::pending_turn::PendingTurn;
+use crate::pending_turn::terminal_event_identity;
+use crate::revision::ResidentRevisionV1;
+
+#[derive(Debug)]
+struct ThreadJournalState {
+    pending: PendingTurn,
+    next_sequence: u64,
+    last_digest: Option<[u8; 32]>,
+    committed_terminals: HashMap<String, [u8; 32]>,
+    commit_faulted: bool,
+}
+
+impl Default for ThreadJournalState {
+    fn default() -> Self {
+        Self {
+            pending: PendingTurn::default(),
+            next_sequence: 1,
+            last_digest: None,
+            committed_terminals: HashMap::new(),
+            commit_faulted: false,
+        }
+    }
+}
+
+/// Fork-owned interception point for RAM-authoritative thread storage.
 ///
-/// FORK-RAM: This wrapper deliberately delegates the complete current
-/// `ThreadStore` surface to upstream's `InMemoryThreadStore`.
+/// FORK-RAM: Upstream's InMemoryThreadStore remains the Phase 02 semantic
+/// resident store. RamJournalThreadStore now owns the durability edge around it:
+/// ordinary appends mutate RAM only, while a terminal turn is encoded and
+/// journaled before append_items() returns.
 ///
-/// The point of Phase 01 is to establish *authority ownership* without also
-/// rewriting every storage behavior at once. Later phases replace individual
-/// operations behind this type with resident compression and the terminal-turn
-/// journal.
-///
-/// In other words: first own the type, then change the physics. Debugging both
-/// simultaneously is how perfectly innocent storage refactors become folklore.
+/// The complete history is still expanded in memory. Compression residency is
+/// Phase 03. We are changing one axis at a time because storage bugs become
+/// remarkably philosophical when representation and durability change together.
 pub struct RamJournalThreadStore {
-    inner: Arc<InMemoryThreadStore>,
+    resident: Arc<InMemoryThreadStore>,
+    journal: JournalWriter,
+    reader: JournalReader,
+    journal_states: Mutex<HashMap<ThreadId, Arc<AsyncMutex<ThreadJournalState>>>>,
+    history_modes: Mutex<HashMap<ThreadId, ThreadHistoryMode>>,
+    bootstrap_params: Mutex<HashMap<ThreadId, CreateThreadParams>>,
 }
 
 impl RamJournalThreadStore {
-    pub fn for_id(id: impl Into<String>) -> Self {
-        let inner = InMemoryThreadStore::for_id(id);
-
-        // SQLITE-NOTE: RamJournal intentionally does not attach StateDbHandle.
-        //
-        // The Local backend remains the compatibility oracle. This backend is
-        // not "RAM-authoritative except for the SQLite authority we forgot to
-        // stop carrying around."
+    pub fn new(id: &str, journal_root: PathBuf) -> Self {
         Self {
-            inner: Arc::new(inner.with_state_db(None)),
+            resident: InMemoryThreadStore::for_id(id),
+            journal: JournalWriter::new(journal_root.clone()),
+            reader: JournalReader::new(journal_root),
+            journal_states: Mutex::new(HashMap::new()),
+            history_modes: Mutex::new(HashMap::new()),
+            bootstrap_params: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn bootstrap_inner(&self) -> &InMemoryThreadStore {
-        self.inner.as_ref()
+    fn journal_state(&self, thread_id: ThreadId) -> Arc<AsyncMutex<ThreadJournalState>> {
+        let mut states = self
+            .journal_states
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        states
+            .entry(thread_id)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(ThreadJournalState::default())))
+            .clone()
+    }
+
+    fn known_journal_state(&self, thread_id: ThreadId) -> Option<Arc<AsyncMutex<ThreadJournalState>>> {
+        self.journal_states
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&thread_id)
+            .cloned()
+    }
+
+    async fn resident_revision(&self, thread_id: ThreadId) -> Option<String> {
+        let state = self.known_journal_state(thread_id)?;
+        let state = state.lock().await;
+        let durable_head_digest = state.last_digest?;
+        let durable_sequence = state.next_sequence.checked_sub(1)?;
+
+        Some(
+            ResidentRevisionV1::new(durable_sequence, durable_head_digest)
+                .to_opaque_string(),
+        )
+    }
+
+    async fn hydrate_from_journal(&self, thread_id: ThreadId) -> ThreadStoreResult<bool> {
+        let reader = self.reader.clone();
+        let read_thread_id = thread_id.clone();
+        let recovered = tokio::task::spawn_blocking(move || reader.recover_thread(read_thread_id))
+            .await
+            .map_err(|error| internal_error(format!("journal reader task failed: {error}")))?
+            .map_err(internal_error)?;
+
+        let Some(recovered) = recovered else {
+            return Ok(false);
+        };
+
+        if recovered.truncated_tail {
+            let writer = self.journal.clone();
+            let truncate_thread_id = thread_id.clone();
+            let valid_bytes = recovered.valid_bytes;
+            tokio::task::spawn_blocking(move || {
+                writer.truncate_to_verified_prefix(truncate_thread_id, valid_bytes)
+            })
+            .await
+            .map_err(|error| internal_error(format!("journal tail cleanup task failed: {error}")))?
+            .map_err(internal_error)?;
+        }
+
+        // A failed first-ever append has a verified prefix of zero bytes. Clean
+        // the partial tail above, then correctly report that no durable thread
+        // exists yet.
+        if recovered.frames.is_empty() {
+            return Ok(false);
+        }
+
+        let bootstrap = recovered
+            .bootstrap()
+            .cloned()
+            .ok_or_else(|| internal_error("RamJournal sequence 1 is missing CreateThreadParams"))?;
+        if bootstrap.thread_id != thread_id {
+            return Err(internal_error(
+                "RamJournal bootstrap thread id does not match journal thread id",
+            ));
+        }
+
+        // FORK-RAM: Cold hydration is the only journal-read phase for this
+        // resident lifetime. Reconstruct the complete logical history in RAM,
+        // then ordinary reads return to the resident store.
+        ThreadStore::create_thread(self.resident.as_ref(), bootstrap.clone()).await?;
+        let mut committed_terminals = HashMap::new();
+        for frame in &recovered.frames {
+            let terminal = terminal_event_identity(&frame.items)
+                .map_err(internal_error)?
+                .ok_or_else(|| internal_error("recovered CJR frame is missing terminal identity"))?;
+            if let Some(previous) =
+                committed_terminals.insert(terminal.turn_id.clone(), terminal.digest)
+            {
+                return Err(internal_error(format!(
+                    "journal contains duplicate durable turn id {} with digests {:x?} and {:x?}",
+                    terminal.turn_id, previous, terminal.digest
+                )));
+            }
+        }
+
+        let recovered_items = recovered.items();
+        if !recovered_items.is_empty() {
+            ThreadStore::append_items(
+                self.resident.as_ref(),
+                AppendThreadItemsParams {
+                    thread_id: thread_id.clone(),
+                    items: recovered_items,
+                },
+            )
+            .await?;
+        }
+
+        self.history_modes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(thread_id.clone(), bootstrap.history_mode);
+        self.bootstrap_params
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(thread_id.clone(), bootstrap);
+
+        let journal_state = self.journal_state(thread_id);
+        let mut state = journal_state.lock().await;
+        state.next_sequence = recovered.next_sequence();
+        state.last_digest = recovered.last_digest();
+        state.committed_terminals = committed_terminals;
+
+        Ok(true)
+    }
+
+    async fn commit_sealed_turn(
+        &self,
+        thread_id: ThreadId,
+        state: &mut ThreadJournalState,
+    ) -> ThreadStoreResult<()> {
+        let Some(sealed) = state.pending.sealed() else {
+            return Ok(());
+        };
+
+        let terminal = terminal_event_identity(&sealed.items)
+            .map_err(internal_error)?
+            .ok_or_else(|| internal_error("sealed RamJournal turn is missing a terminal event"))?;
+        if terminal.turn_id != sealed.turn_id {
+            return Err(internal_error(format!(
+                "sealed RamJournal turn id {} does not match terminal event {}",
+                sealed.turn_id, terminal.turn_id
+            )));
+        }
+
+        let sequence = state.next_sequence;
+        let bootstrap = if sequence == 1 {
+            Some(
+                self.bootstrap_params
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&thread_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        internal_error(
+                            "first RamJournal commit is missing CreateThreadParams bootstrap",
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        let frame = encode_turn_frame(
+            thread_id,
+            &sealed.turn_id,
+            sequence,
+            state.last_digest,
+            bootstrap.as_ref(),
+            &sealed.items,
+        )
+        .map_err(internal_error)?;
+
+        if state.commit_faulted {
+            // JOURNAL-NOTE: A failed attempt can leave one of three things:
+            // no new bytes, a truncated tail, or the complete frame followed by
+            // a failed durability fence. Inspect exactly once on the retry path;
+            // ordinary loaded commits still perform zero journal reads.
+            let reader = self.reader.clone();
+            let recovered = tokio::task::spawn_blocking(move || reader.recover_thread(thread_id))
+                .await
+                .map_err(|error| {
+                    internal_error(format!("journal retry recovery task failed: {error}"))
+                })?
+                .map_err(internal_error)?;
+
+            match recovered {
+                None => {
+                    if state.last_digest.is_some() || sequence != 1 {
+                        return Err(internal_error(
+                            "faulted RamJournal retry lost an existing durable prefix",
+                        ));
+                    }
+                }
+                Some(recovered) => {
+                    let prefix_matches = recovered.last_digest() == state.last_digest
+                        && recovered.next_sequence() == sequence;
+
+                    if recovered.truncated_tail {
+                        if !prefix_matches {
+                            return Err(internal_error(
+                                "faulted RamJournal tail does not follow the resident durable head",
+                            ));
+                        }
+
+                        let writer = self.journal.clone();
+                        let valid_bytes = recovered.valid_bytes;
+                        tokio::task::spawn_blocking(move || {
+                            writer.truncate_to_verified_prefix(thread_id, valid_bytes)
+                        })
+                        .await
+                        .map_err(|error| {
+                            internal_error(format!(
+                                "journal retry tail cleanup task failed: {error}"
+                            ))
+                        })?
+                        .map_err(internal_error)?;
+                    } else if recovered.last_digest() == Some(frame.digest)
+                        && recovered
+                            .frames
+                            .last()
+                            .is_some_and(|recovered_frame| {
+                                recovered_frame.sequence == sequence
+                                    && recovered_frame.turn_id == sealed.turn_id
+                            })
+                    {
+                        // The data write completed and only the durability fence
+                        // failed. Do not append the same turn twice; sync the
+                        // already verified bytes and acknowledge that frame.
+                        let writer = self.journal.clone();
+                        tokio::task::spawn_blocking(move || writer.sync_thread(thread_id))
+                            .await
+                            .map_err(|error| {
+                                internal_error(format!(
+                                    "journal retry sync task failed: {error}"
+                                ))
+                            })?
+                            .map_err(internal_error)?;
+
+                        state
+                            .pending
+                            .mark_committed(&sealed.turn_id)
+                            .map_err(internal_error)?;
+                        state
+                            .committed_terminals
+                            .insert(terminal.turn_id, terminal.digest);
+                        state.last_digest = Some(frame.digest);
+                        state.next_sequence = state
+                            .next_sequence
+                            .checked_add(1)
+                            .ok_or_else(|| internal_error("journal sequence overflow"))?;
+                        state.commit_faulted = false;
+                        return Ok(());
+                    } else if !prefix_matches {
+                        return Err(internal_error(
+                            "faulted RamJournal retry found an unexpected durable tail",
+                        ));
+                    }
+                }
+            }
+
+            state.commit_faulted = false;
+        }
+
+        let frame_digest = frame.digest;
+        let writer = self.journal.clone();
+        let append_result =
+            tokio::task::spawn_blocking(move || writer.append_turn_frame(thread_id, &frame))
+                .await
+                .map_err(|error| {
+                    internal_error(format!("journal writer task failed: {error}"))
+                });
+
+        let append_result = match append_result {
+            Ok(result) => result.map_err(internal_error),
+            Err(error) => Err(error),
+        };
+
+        if let Err(error) = append_result {
+            // JOURNAL-NOTE: Keep the exact sealed transaction resident and mark
+            // the disk tail suspect. The next retry reconciles the journal
+            // before it considers another data write.
+            state.commit_faulted = true;
+            return Err(error);
+        }
+
+        state
+            .pending
+            .mark_committed(&sealed.turn_id)
+            .map_err(internal_error)?;
+        state
+            .committed_terminals
+            .insert(terminal.turn_id, terminal.digest);
+        state.last_digest = Some(frame_digest);
+        state.next_sequence = state
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| internal_error("journal sequence overflow"))?;
+        state.commit_faulted = false;
+
+        Ok(())
+    }
+}
+
+fn history_mode_from_items(items: &[RolloutItem]) -> Option<ThreadHistoryMode> {
+    items.iter().find_map(|item| match item {
+        RolloutItem::SessionMeta(meta) => Some(meta.meta.history_mode),
+        _ => None,
+    })
+}
+
+fn internal_error(error: impl std::fmt::Display) -> ThreadStoreError {
+    ThreadStoreError::Internal {
+        message: error.to_string(),
     }
 }
 
@@ -44,308 +408,344 @@ impl ThreadStore for RamJournalThreadStore {
         self
     }
 
-    fn default_history_mode(&self) -> codex_protocol::protocol::ThreadHistoryMode {
-        self.inner.default_history_mode()
+    fn requires_terminal_durability_before_delivery(&self) -> bool {
+        // FORK-INVARIANT: RamJournal terminal events are durability receipts.
+        //
+        // If the frame did not commit, the client does not get to hear
+        // "completed" merely because upstream's generic failure policy is more
+        // optimistic than this backend contract.
+        true
     }
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
-        self.inner.create_thread(params)
-    }
-
-    fn stage_pending_thread_metadata(
-        &self,
-        thread_id: codex_protocol::ThreadId,
-        patch: ThreadMetadataPatch,
-    ) -> ThreadStoreFuture<'_, ()> {
-        self.inner.stage_pending_thread_metadata(thread_id, patch)
-    }
-
-    fn read_pending_thread_metadata(
-        &self,
-        thread_id: codex_protocol::ThreadId,
-    ) -> ThreadStoreFuture<'_, Option<ThreadMetadataPatch>> {
-        self.inner.read_pending_thread_metadata(thread_id)
-    }
-
-    fn remove_pending_thread_metadata(
-        &self,
-        thread_id: codex_protocol::ThreadId,
-    ) -> ThreadStoreFuture<'_, ()> {
-        self.inner.remove_pending_thread_metadata(thread_id)
+        let thread_id = params.thread_id.clone();
+        let history_mode = params.history_mode;
+        let bootstrap = params.clone();
+        Box::pin(async move {
+            ThreadStore::create_thread(self.resident.as_ref(), params).await?;
+            self.history_modes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(thread_id.clone(), history_mode);
+            self.bootstrap_params
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(thread_id, bootstrap);
+            Ok(())
+        })
     }
 
     fn resume_thread(
         &self,
         params: ResumeThreadParams,
     ) -> ThreadStoreFuture<'_, Arc<Vec<RolloutItem>>> {
-        // AUTHORITY-NOTE: Upstream now requires resume to return the replay
-        // history observed under writer ownership.
-        //
-        // This is exactly the right semantic boundary for RamJournal: cold state
-        // may be inspected before ownership, but the live authority must publish
-        // the canonical replay view *after* it owns mutation ordering.
-        //
-        // Phase 01 delegates that contract to InMemoryThreadStore. Phase 02
-        // replaces the validation source with our durable journal head instead
-        // of filesystem revision folklore.
-        self.inner.resume_thread(params)
+        let thread_id = params.thread_id;
+        let history_mode = params
+            .history
+            .as_deref()
+            .and_then(history_mode_from_items)
+            .unwrap_or_default();
+
+        Box::pin(async move {
+            // AUTHORITY-NOTE: If a previous read already hydrated this thread,
+            // resume performs no journal read. Otherwise cold resume verifies
+            // and installs the durable journal before publishing canonical
+            // replay history under live ownership.
+            //
+            // Canonical supplied snapshots therefore cannot overwrite a newer
+            // journal head. Headerless explicit overrides retain upstream's
+            // existing import semantics inside InMemoryThreadStore.
+            if self.known_journal_state(thread_id).is_none() {
+                let _ = self.hydrate_from_journal(thread_id).await?;
+            }
+
+            let history = ThreadStore::resume_thread(self.resident.as_ref(), params).await?;
+            self.history_modes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(thread_id)
+                .or_insert(history_mode);
+
+            Ok(history)
+        })
     }
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
-        // FORK-RAM: Phase 01 append is a resident mutation only.
-        //
-        // There is deliberately no durable side effect here. Terminal-turn
-        // framing arrives in Phase 02; until then disk does not get a courtesy
-        // notification every time the model has a thought.
-        self.inner.append_items(params)
-    }
+        let resident = Arc::clone(&self.resident);
+        let thread_id = params.thread_id;
+        let journal_state = self.journal_state(thread_id);
 
-    fn record_thread_metadata(
-        &self,
-        params: UpdateThreadMetadataParams,
-    ) -> ThreadStoreFuture<'_, ()> {
-        self.inner.record_thread_metadata(params)
+        Box::pin(async move {
+            // FORK-INVARIANT: serialize append/commit activity per thread.
+            // Distinct threads remain independent, while one thread cannot race
+            // its own turn sequence into two different versions of reality.
+            let mut state = journal_state.lock().await;
+
+            let history_mode = self
+                .history_modes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&thread_id)
+                .copied()
+                .unwrap_or_default();
+            let persisted_items = persisted_rollout_items(&params.items, history_mode);
+            let terminal = terminal_event_identity(&persisted_items).map_err(internal_error)?;
+
+            if let Some(terminal) = terminal.as_ref()
+                && let Some(committed_digest) =
+                    state.committed_terminals.get(&terminal.turn_id)
+            {
+                if committed_digest == &terminal.digest && persisted_items.len() == 1 {
+                    // JOURNAL-NOTE: Lost acknowledgement retry. The same
+                    // terminal event is already durable, so do not mutate RAM
+                    // again and definitely do not append another frame.
+                    return Ok(());
+                }
+                return Err(ThreadStoreError::Conflict {
+                    message: format!(
+                        "turn {} is already durable; retry carries different or additional persisted content",
+                        terminal.turn_id
+                    ),
+                });
+            }
+
+            if let Some(sealed) = state.pending.sealed() {
+                let sealed_terminal = terminal_event_identity(&sealed.items)
+                    .map_err(internal_error)?
+                    .ok_or_else(|| {
+                        internal_error("sealed RamJournal turn is missing a terminal event")
+                    })?;
+
+                if let Some(incoming) = terminal.as_ref()
+                    && incoming.turn_id == sealed.turn_id
+                    && incoming.digest == sealed_terminal.digest
+                    && persisted_items.len() == 1
+                {
+                    // JOURNAL-NOTE: The previous durability attempt failed
+                    // after resident state already observed the terminal item.
+                    // Retry the sealed transaction directly; re-appending the
+                    // event would duplicate RAM history before disk even gets
+                    // another chance to behave.
+                    return self.commit_sealed_turn(thread_id, &mut state).await;
+                }
+
+                return Err(ThreadStoreError::Conflict {
+                    message: format!(
+                        "turn {} is sealed but not durable; settle that commit before appending new persisted items",
+                        sealed.turn_id
+                    ),
+                });
+            }
+
+            // RAM remains primary. Only after retry/conflict checks does the
+            // resident store observe this append.
+            ThreadStore::append_items(resident.as_ref(), params).await?;
+
+            // COMPAT-NOTE: The durable frame uses upstream's canonical
+            // persistence filter. Raw transient events can remain useful to
+            // runtime observers without becoming surprise journal ontology.
+            state
+                .pending
+                .push(&persisted_items)
+                .map_err(internal_error)?;
+
+            if state.pending.sealed().is_none() {
+                // FORK-RAM: Nonterminal append. Deliberately no persistent I/O.
+                return Ok(());
+            }
+
+            self.commit_sealed_turn(thread_id, &mut state).await
+        })
     }
 
     fn persist_thread(
         &self,
-        thread_id: codex_protocol::ThreadId,
+        thread_id: ThreadId,
         context: PersistContext,
     ) -> ThreadStoreFuture<'_, ()> {
-        // FORK-RAM: In the bootstrap backend, upstream persistence checkpoints
-        // are RAM fences because the delegate has no durable store attached.
-        //
-        // REBASE-NOTE: inspect new PersistContext variants before forwarding
-        // them here. A new upstream checkpoint does not automatically deserve a
-        // filesystem ceremony.
-        self.inner.persist_thread(thread_id, context)
+        // FORK-RAM: Upstream persistence checkpoints remain RAM fences for this
+        // backend. The terminal RolloutItem, not PersistContext, owns the
+        // Phase 02 journal commit.
+        ThreadStore::persist_thread(self.resident.as_ref(), thread_id, context)
     }
 
-    fn flush_thread(&self, thread_id: codex_protocol::ThreadId) -> ThreadStoreFuture<'_, ()> {
-        self.inner.flush_thread(thread_id)
+    fn flush_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let journal_state = self.journal_state(thread_id);
+            let mut state = journal_state.lock().await;
+
+            // FORK-RAM: A pre-terminal flush still creates no disk traffic.
+            // A sealed turn means a prior terminal commit attempt failed, so
+            // flush is the durability fence that retries that exact resident
+            // transaction without re-appending its terminal event.
+            self.commit_sealed_turn(thread_id, &mut state).await?;
+            drop(state);
+
+            ThreadStore::flush_thread(self.resident.as_ref(), thread_id).await
+        })
     }
 
-    fn shutdown_thread(&self, thread_id: codex_protocol::ThreadId) -> ThreadStoreFuture<'_, ()> {
-        self.inner.shutdown_thread(thread_id)
+    fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
+        ThreadStore::shutdown_thread(self.resident.as_ref(), thread_id)
     }
 
-    fn discard_thread(&self, thread_id: codex_protocol::ThreadId) -> ThreadStoreFuture<'_, ()> {
-        self.inner.discard_thread(thread_id)
+    fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
+        ThreadStore::discard_thread(self.resident.as_ref(), thread_id)
     }
 
     fn load_history(
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredThreadHistory> {
-        self.inner.load_history(params)
+        Box::pin(async move {
+            let thread_id = params.thread_id;
+            let mut history =
+                match ThreadStore::load_history(self.resident.as_ref(), params.clone()).await {
+                    Ok(history) => history,
+                    Err(ThreadStoreError::ThreadNotFound { .. }) => {
+                        if self.hydrate_from_journal(thread_id).await? {
+                            ThreadStore::load_history(self.resident.as_ref(), params).await?
+                        } else {
+                            return Err(ThreadStoreError::ThreadNotFound { thread_id });
+                        }
+                    }
+                    Err(error) => return Err(error),
+                };
+
+            // FORK-RAM: upstream's revision slot now carries semantic journal
+            // freshness. No pathname, inode, or mtime is invited to vote.
+            history.revision = self.resident_revision(thread_id).await;
+            Ok(history)
+        })
     }
 
     fn load_latest_model_context(
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
-        self.inner.load_latest_model_context(params)
-    }
+        Box::pin(async move {
+            let thread_id = params.thread_id;
+            let mut context =
+                match ThreadStore::load_latest_model_context(self.resident.as_ref(), params.clone())
+                    .await
+                {
+                    Ok(context) => context,
+                    Err(ThreadStoreError::ThreadNotFound { .. }) => {
+                        if self.hydrate_from_journal(thread_id).await? {
+                            ThreadStore::load_latest_model_context(self.resident.as_ref(), params)
+                                .await?
+                        } else {
+                            return Err(ThreadStoreError::ThreadNotFound { thread_id });
+                        }
+                    }
+                    Err(error) => return Err(error),
+                };
 
-    fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
-        self.inner.prepare_fork(params)
-    }
-
-    fn revert_thread(&self, params: RevertThreadParams) -> ThreadStoreFuture<'_, ()> {
-        self.inner.revert_thread(params)
+            context.revision = self.resident_revision(thread_id).await;
+            Ok(context)
+        })
     }
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
-        self.inner.read_thread(params)
+        Box::pin(async move {
+            let thread_id = params.thread_id;
+            let mut thread = match ThreadStore::read_thread(self.resident.as_ref(), params.clone()).await {
+                Ok(thread) => thread,
+                Err(ThreadStoreError::ThreadNotFound { .. }) => {
+                    if self.hydrate_from_journal(thread_id).await? {
+                        ThreadStore::read_thread(self.resident.as_ref(), params).await?
+                    } else {
+                        return Err(ThreadStoreError::ThreadNotFound { thread_id });
+                    }
+                }
+                Err(error) => return Err(error),
+            };
+
+            if let Some(history) = thread.history.as_mut() {
+                history.revision = self.resident_revision(thread_id).await;
+            }
+            Ok(thread)
+        })
     }
 
     fn read_thread_by_rollout_path(
         &self,
         params: ReadThreadByRolloutPathParams,
     ) -> ThreadStoreFuture<'_, StoredThread> {
-        self.inner.read_thread_by_rollout_path(params)
+        ThreadStore::read_thread_by_rollout_path(self.resident.as_ref(), params)
     }
 
     fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage> {
-        self.inner.list_threads(params)
-    }
+        Box::pin(async move {
+            let reader = self.reader.clone();
+            let durable_ids = tokio::task::spawn_blocking(move || reader.list_thread_ids())
+                .await
+                .map_err(|error| {
+                    internal_error(format!("journal discovery task failed: {error}"))
+                })?
+                .map_err(internal_error)?;
 
-    fn supports_thread_sections(&self) -> bool {
-        self.inner.supports_thread_sections()
-    }
+            // RESIDENCY-NOTE: Phase 02 eagerly hydrates every cold durable thread
+            // before delegating list/filter/page semantics to the resident store.
+            //
+            // This is deliberately correct and deliberately expensive. Phase 03
+            // replaces it with a resident metadata catalog. Do not "optimize"
+            // this temporary path into a clever partial disk cache and then
+            // accidentally preserve the wrong architecture forever.
+            for thread_id in durable_ids {
+                match ThreadStore::read_thread(
+                    self.resident.as_ref(),
+                    ReadThreadParams {
+                        thread_id: thread_id.clone(),
+                        include_archived: true,
+                        include_history: false,
+                    },
+                )
+                .await
+                {
+                    Ok(_) => {}
+                    Err(ThreadStoreError::ThreadNotFound { .. }) => {
+                        let _ = self.hydrate_from_journal(thread_id).await?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
 
-    fn list_thread_sections(
-        &self,
-        params: ListThreadSectionsParams,
-    ) -> ThreadStoreFuture<'_, StoredThreadSectionsPage> {
-        self.inner.list_thread_sections(params)
-    }
-
-    fn create_thread_section(
-        &self,
-        params: CreateThreadSectionParams,
-    ) -> ThreadStoreFuture<'_, StoredThreadSection> {
-        self.inner.create_thread_section(params)
-    }
-
-    fn rename_thread_section(
-        &self,
-        params: RenameThreadSectionParams,
-    ) -> ThreadStoreFuture<'_, Option<StoredThreadSection>> {
-        self.inner.rename_thread_section(params)
-    }
-
-    fn delete_thread_section(
-        &self,
-        params: DeleteThreadSectionParams,
-    ) -> ThreadStoreFuture<'_, bool> {
-        self.inner.delete_thread_section(params)
-    }
-
-    fn supports_thread_attachments(&self) -> bool {
-        self.inner.supports_thread_attachments()
-    }
-
-    fn copy_thread_attachments(
-        &self,
-        source_thread_id: codex_protocol::ThreadId,
-        destination_thread_id: codex_protocol::ThreadId,
-    ) -> ThreadStoreFuture<'_, ()> {
-        self.inner
-            .copy_thread_attachments(source_thread_id, destination_thread_id)
-    }
-
-    fn add_thread_attachment(
-        &self,
-        params: AddThreadAttachmentParams,
-    ) -> ThreadStoreFuture<'_, AddThreadAttachmentOutcome> {
-        self.inner.add_thread_attachment(params)
-    }
-
-    fn list_thread_attachments(
-        &self,
-        params: ListThreadAttachmentsParams,
-    ) -> ThreadStoreFuture<'_, ThreadAttachmentPage> {
-        self.inner.list_thread_attachments(params)
-    }
-
-    fn remove_thread_attachment(
-        &self,
-        params: RemoveThreadAttachmentParams,
-    ) -> ThreadStoreFuture<'_, RemoveThreadAttachmentOutcome> {
-        self.inner.remove_thread_attachment(params)
-    }
-
-    fn supports_projects(&self) -> bool {
-        self.inner.supports_projects()
-    }
-
-    fn list_projects(
-        &self,
-        params: ListProjectsParams,
-    ) -> ThreadStoreFuture<'_, StoredProjectsPage> {
-        self.inner.list_projects(params)
-    }
-
-    fn read_project(&self, project_id: String) -> ThreadStoreFuture<'_, Option<StoredProject>> {
-        self.inner.read_project(project_id)
-    }
-
-    fn create_project(
-        &self,
-        params: CreateProjectParams,
-    ) -> ThreadStoreFuture<'_, CreatedProject> {
-        self.inner.create_project(params)
-    }
-
-    fn update_project(
-        &self,
-        params: UpdateProjectParams,
-    ) -> ThreadStoreFuture<'_, Option<UpdatedProject>> {
-        self.inner.update_project(params)
-    }
-
-    fn move_project(
-        &self,
-        params: MoveProjectParams,
-    ) -> ThreadStoreFuture<'_, Option<ProjectMoveOutcome>> {
-        self.inner.move_project(params)
-    }
-
-    fn delete_project(&self, project_id: String) -> ThreadStoreFuture<'_, Option<DeletedProject>> {
-        self.inner.delete_project(project_id)
-    }
-
-    fn supports_paginated_history_lists(&self) -> bool {
-        self.inner.supports_paginated_history_lists()
-    }
-
-    fn search_threads(
-        &self,
-        params: SearchThreadsParams,
-    ) -> ThreadStoreFuture<'_, ThreadSearchPage> {
-        self.inner.search_threads(params)
-    }
-
-    fn search_thread_occurrences(
-        &self,
-        params: SearchThreadOccurrencesParams,
-    ) -> ThreadStoreFuture<'_, ThreadOccurrenceSearchPage> {
-        self.inner.search_thread_occurrences(params)
-    }
-
-    fn list_turns(&self, params: ListTurnsParams) -> ThreadStoreFuture<'_, TurnPage> {
-        self.inner.list_turns(params)
-    }
-
-    fn list_items(&self, params: ListItemsParams) -> ThreadStoreFuture<'_, ItemPage> {
-        self.inner.list_items(params)
-    }
-
-    fn list_timeline(
-        &self,
-        params: ListTimelineParams,
-    ) -> ThreadStoreFuture<'_, TimelinePage> {
-        self.inner.list_timeline(params)
+            ThreadStore::list_threads(self.resident.as_ref(), params).await
+        })
     }
 
     fn update_thread_metadata(
         &self,
         params: UpdateThreadMetadataParams,
     ) -> ThreadStoreFuture<'_, Option<StoredThread>> {
-        self.inner.update_thread_metadata(params)
+        ThreadStore::update_thread_metadata(self.resident.as_ref(), params)
     }
 
     fn move_thread_to_section(
         &self,
         params: MoveThreadToSectionParams,
     ) -> ThreadStoreFuture<'_, ()> {
-        self.inner.move_thread_to_section(params)
+        ThreadStore::move_thread_to_section(self.resident.as_ref(), params)
     }
 
     fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()> {
-        self.inner.archive_thread(params)
-    }
-
-    fn archive_threads(
-        &self,
-        params: ArchiveThreadsParams,
-    ) -> ThreadStoreFuture<'_, Vec<codex_protocol::ThreadId>> {
-        self.inner.archive_threads(params)
+        ThreadStore::archive_thread(self.resident.as_ref(), params)
     }
 
     fn unarchive_thread(
         &self,
         params: ArchiveThreadParams,
     ) -> ThreadStoreFuture<'_, StoredThread> {
-        self.inner.unarchive_thread(params)
+        ThreadStore::unarchive_thread(self.resident.as_ref(), params)
     }
 
     fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()> {
-        self.inner.delete_thread(params)
-    }
-
-    fn delete_threads(&self, params: DeleteThreadsParams) -> ThreadStoreFuture<'_, ()> {
-        self.inner.delete_threads(params)
+        ThreadStore::delete_thread(self.resident.as_ref(), params)
     }
 }
+
+
+#[cfg(test)]
+#[path = "thread_store_tests.rs"]
+mod tests;

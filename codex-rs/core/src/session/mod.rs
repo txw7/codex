@@ -2481,7 +2481,39 @@ impl Session {
         // Persist the event into rollout storage; the store applies its persistence policy.
         if persist {
             let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
-            self.persist_rollout_items(&rollout_items).await;
+            let mut persisted = self.persist_rollout_items(&rollout_items).await;
+            let is_terminal = matches!(
+                &event.msg,
+                EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
+            );
+            let strict_terminal_durability = is_terminal
+                && self
+                    .live_thread()
+                    .is_some_and(LiveThread::requires_terminal_durability_before_delivery);
+
+            if strict_terminal_durability && !persisted {
+                // FORK-RAM: RamJournal may leave the exact terminal transaction
+                // sealed in RAM after a failed append/sync. Give its durability
+                // fence one retry path, then replay the terminal append only as
+                // an acknowledgement check.
+                //
+                // LocalThreadStore keeps upstream's existing failure policy.
+                // This branch exists solely because RamJournal says
+                // "completed" is a receipt, not positive thinking.
+                if let Err(error) = self.flush_rollout().await {
+                    error!(
+                        "withholding terminal event because RamJournal durability retry failed: {error}"
+                    );
+                    return;
+                }
+                persisted = self.persist_rollout_items(&rollout_items).await;
+                if !persisted {
+                    error!(
+                        "withholding terminal event because RamJournal could not confirm durable commit"
+                    );
+                    return;
+                }
+            }
         }
         self.services
             .rollout_thread_trace

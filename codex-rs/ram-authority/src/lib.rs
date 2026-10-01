@@ -5,10 +5,13 @@
 //! Later phases replace that representation behind this crate boundary with
 //! compressed resident frames and terminal-turn journal commits.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
+mod journal;
+mod pending_turn;
 mod revision;
 mod thread_store;
-
-use std::sync::Arc;
 
 use codex_thread_store::ThreadStore;
 
@@ -28,14 +31,15 @@ pub use thread_store::RamJournalThreadStore;
 ///
 /// Replacing the boring proof with the clever implementation before the proof
 /// works would be an excellent way to debug four architectures simultaneously.
-pub fn build_bootstrap_thread_store(id: &str) -> Arc<dyn ThreadStore> {
-    // FORK-RAM: Core now receives a fork-owned store identity even though
-    // Phase 01 still delegates behavior to upstream's in-memory implementation.
-    //
-    // That distinction matters: later journal/residency work lands behind this
-    // type instead of changing core's composition seam every time the backend
-    // graduates from another piece of training-wheel infrastructure.
-    Arc::new(RamJournalThreadStore::for_id(id))
+pub fn build_bootstrap_thread_store(
+    id: &str,
+    codex_home: PathBuf,
+) -> Arc<dyn ThreadStore> {
+    // AUTHORITY-NOTE: CODEX_HOME determines journal placement, not thread
+    // identity. Thread identity remains ThreadId; placement can move later
+    // without asking pathnames to become ontology.
+    let journal_root = codex_home.join("ram-journal");
+    Arc::new(RamJournalThreadStore::new(id, journal_root))
 }
 
 #[cfg(test)]
@@ -43,20 +47,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bootstrap_backend_is_the_fork_owned_ram_authority() {
-        let store = build_bootstrap_thread_store("ram-authority-bootstrap-test");
+    fn bootstrap_backend_is_the_explicit_in_memory_authority() {
+        let store = build_bootstrap_thread_store(
+            "ram-authority-bootstrap-test",
+            std::env::temp_dir(),
+        );
 
-        // FORK-INVARIANT: Core must receive the fork-owned runtime type.
-        //
-        // If this starts reporting InMemoryThreadStore directly again, somebody
-        // has helpfully turned "RamJournal" back into a config alias.
-        let ram_store = store
-            .as_any()
-            .downcast_ref::<RamJournalThreadStore>()
-            .expect("ram_journal must resolve to RamJournalThreadStore");
-
-        // Phase 01 still delegates semantics to upstream's in-memory store.
-        // Later phases replace this delegate behind the same fork-owned type.
-        let _bootstrap_delegate = ram_store.bootstrap_inner();
+        // FORK-INVARIANT: the production selection now resolves to the
+        // fork-owned wrapper, not directly to an upstream backend.
+        assert!(store.as_any().is::<RamJournalThreadStore>());
     }
 }

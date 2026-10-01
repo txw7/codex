@@ -80,17 +80,15 @@ The next phase replaces expanded resident history with `PendingTurnV1` plus term
 
 Upstream symbol: `codex_thread_store::ThreadStore`
 
-Fork behavior: wraps the complete current trait surface in `RamJournalThreadStore` while Phase 01 delegates semantics to upstream `InMemoryThreadStore`.
+Fork behavior: wraps the complete current trait surface in `RamJournalThreadStore` and evolves journal semantics behind that owned type.
 
-Reason: core must see a fork-owned production backend identity before journal/residency behavior begins to diverge.
+Reason: core sees one fork-owned production backend identity while storage physics change behind the maintained seam.
 
 Fork implementation: `codex-rs/ram-authority/src/thread_store.rs`
 
-Merge rule: when upstream adds or changes ThreadStore methods, update the wrapper deliberately. Do not allow a newly added upstream capability to vanish merely because the fork wrapper forgot it exists.
+Merge rule: when upstream adds or changes ThreadStore methods, update the wrapper deliberately. Do not allow a new upstream capability to disappear because the fork wrapper forgot it exists.
 
-Test expectation: RamJournal resolves to `RamJournalThreadStore`; Phase 01 delegate remains in-memory and carries no StateDbHandle.
-
-Snark note: owning the wrapper means future storage physics can change behind one seam instead of making `thread_manager.rs` participate in every new architectural hobby.
+Test expectation: RamJournal resolves to `RamJournalThreadStore`; Local and InMemory remain independent upstream backends.
 
 
 ### RAM-TS-005
@@ -101,8 +99,70 @@ Fork behavior: preserve upstream's authoritative-resume contract, but validate R
 
 Reason: cold-loaded state may become stale before live ownership is established. The live authority must publish a replay view proven current against the journal head.
 
-Fork implementation: `codex-rs/ram-authority/src/revision.rs`
+Fork implementation: `codex-rs/ram-authority/src/revision.rs` and `thread_store.rs`
 
 Merge rule: if upstream changes snapshot-validation semantics again, preserve the semantic requirement first. Do not inherit LocalThreadStore's filesystem-derived revision encoding unless the journal somehow develops an inode-based personality.
 
 Test expectation: RamJournal revisions round-trip through the opaque upstream slot; foreign revision namespaces are rejected and force canonical reload.
+
+
+## Phase 02 terminal journal status
+
+RamJournal now owns an actual terminal-turn durability edge.
+
+Implemented:
+
+- ordinary upstream persistence checkpoints remain RAM-only fences;
+- canonical persisted RolloutItems accumulate in `PendingTurn`;
+- `TurnComplete` / `TurnAborted` seal one logical turn;
+- CJR V1 frames preserve upstream RolloutItem semantics;
+- each turn payload is independently zstd-compressed;
+- BLAKE3 protects each compressed payload;
+- frames carry a previous-frame digest for chain continuity;
+- sequence 1 carries `CreateThreadParams` bootstrap metadata;
+- the complete frame is assembled in RAM before I/O;
+- successful commit performs one application data `write()`, then `sync_data()`;
+- a short positive write faults instead of being completed by a write loop;
+- sealed resident state is released only after write + sync acknowledgement;
+- identical terminal retries are idempotent by turn id + terminal-event digest;
+- conflicting retries fail as `ThreadStoreError::Conflict`;
+- cold recovery validates frame format, thread id, sequence, digest chain, and terminal semantics;
+- only an incomplete final frame is treated as a recoverable tail;
+- a partial first-ever frame truncates back to zero durable bytes;
+- cold hydration rebuilds the upstream in-memory authority once, after which ordinary reads remain RAM-only;
+- Phase 02 `thread/list` can rediscover durable journals after resident RAM is gone.
+
+Explicitly **not** claimed yet:
+
+- cold historical frames are not yet kept compressed in resident RAM; recovery expands them;
+- decoded-history memory is not yet bounded;
+- `thread/list` currently gets correctness by eagerly hydrating cold journals;
+- memfd / strict swap containment is not implemented;
+- multi-process writer ownership/authority fencing is not implemented;
+- standalone archive/rename/revert/metadata administration is not yet CJR-durable;
+- Factory/Bifrost authority routing is not implemented;
+- local Cargo checks and focused Rust tests still need to be executed outside this GitHub-only editing surface.
+
+The final bullet is deliberately boring and therefore important. A test existing in source is not the same thing as a test having run. This fork is already opinionated enough without becoming metaphysical about CI receipts.
+
+
+### RAM-TS-006
+
+Upstream symbols:
+- `codex_thread_store::ThreadStore::requires_terminal_durability_before_delivery`
+- `codex_thread_store::LiveThread::requires_terminal_durability_before_delivery`
+- `Session::send_event_raw_with_persistence`
+
+Fork behavior: RamJournal opts into terminal-delivery gating. If terminal persistence fails, Session retries the sealed durability fence and requires an idempotent acknowledgement before delivering `TurnComplete` or `TurnAborted`.
+
+Reason: in RamJournal, a terminal event is also the durability receipt. Announcing completion after the journal rejected the turn violates the storage contract even if upstream Local storage prefers a more permissive failure policy.
+
+Merge rule: if upstream changes event persistence/delivery ordering, re-audit this gate before resolving the merge. Do not replace it with a RamJournal concrete-type check; capability belongs to the storage boundary.
+
+Tests/receipts:
+- faulted sealed commit remains retryable in RAM;
+- truncated tail is repaired before retry append;
+- complete unacknowledged frame is synced rather than duplicated;
+- Local/InMemory retain the default non-strict policy.
+
+Snark note: "completed, except the part where persistence failed" is not a useful terminal state.

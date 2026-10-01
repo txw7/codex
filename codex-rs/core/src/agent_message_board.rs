@@ -21,6 +21,7 @@ use codex_agent_message_board_extension::MessageBoardHost;
 use codex_agent_message_board_extension::NotificationDelivery;
 use codex_agent_message_board_extension::PostPreview;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::ThreadStartInput;
 use codex_features::Feature;
 use codex_http_client::ClientRouteClass;
 use codex_protocol::AgentPath;
@@ -40,19 +41,31 @@ pub fn install_agent_message_board(
     registry: &mut ExtensionRegistryBuilder<Config>,
     manager: Weak<ThreadManager>,
 ) {
+    codex_agent_message_board_client::install_notifications(registry, |input| {
+        let board = input.thread_store.get::<RemoteAgentMessageBoard>()?;
+        let host = input.thread_store.get::<LocalBoardHost>()?;
+        Some((
+            board,
+            Arc::new(LocalBoardHost {
+                expected_turn_id: Some(input.turn_id.into()),
+                ..host.as_ref().clone()
+            }),
+        ))
+    });
     let in_memory_boards = Arc::new(InMemoryMessageBoards::default());
     codex_agent_message_board_extension::install(
         registry,
         MULTI_AGENT_V2_NAMESPACE_DESCRIPTION,
         |config: &Config| config.multi_agent_v2.tool_namespace.clone(),
-        move |config: &Config, tree, caller| {
+        move |input: &ThreadStartInput<'_, Config>, tree, caller| {
+            let config = input.config;
             let in_memory = config.multi_agent_v2.message_board_in_memory
                 || matches!(
                     &config.experimental_thread_store,
                     ThreadStoreConfig::RamJournal { .. }
                 );
 
-            // SQLITE-NOTE: RamJournal sessions use the upstream in-memory board
+            // SQLITE-NOTE: RamJournal sessions use upstream's in-memory board
             // unless a remote board is explicitly configured.
             //
             // A RAM-authoritative thread with a SQLite-authoritative side chat
@@ -75,6 +88,7 @@ pub fn install_agent_message_board(
                 manager: manager.clone(),
                 tree,
                 caller,
+                expected_turn_id: None,
             });
             Box::pin(async move {
                 let board: Arc<dyn AgentMessageBoard> = if let Some(remote) = remote {
@@ -91,13 +105,14 @@ pub fn install_agent_message_board(
                     let http = http_factory
                         .build_client(&remote.url, ClientRouteClass::Api)
                         .map_err(|err| CodexErr::Io(std::io::Error::other(err)))?;
+                    input.thread_store.insert(host.as_ref().clone());
                     let board = RemoteAgentMessageBoard::new(http, &remote.url, tree, token)
                         .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?
                         .with_clock(move |caller| {
                             let host = host.clone();
                             Box::pin(async move { host.current_time(caller).await })
                         });
-                    Arc::new(board)
+                    input.thread_store.get_or_init(|| board)
                 } else if in_memory {
                     Arc::new(in_memory_boards.open(tree, host).await)
                 } else {
@@ -109,10 +124,12 @@ pub fn install_agent_message_board(
     );
 }
 
+#[derive(Clone)]
 struct LocalBoardHost {
     manager: Weak<ThreadManager>,
     tree: SessionId,
     caller: ThreadId,
+    expected_turn_id: Option<String>,
 }
 
 impl LocalBoardHost {
@@ -226,6 +243,18 @@ impl MessageBoardHost for LocalBoardHost {
                 notice.render(),
                 /*trigger_turn*/ false,
             );
+            // Remote metadata is untrusted. Skip an oversized notice without closing
+            // the receiver; the post remains available through the board tools.
+            if self.expected_turn_id.is_some()
+                && communication.content.len()
+                    + communication.author.as_str().len()
+                    + communication.recipient.as_str().len()
+                    > 1024
+            {
+                return Err(CodexErr::InvalidRequest(
+                    "remote board notice exceeds the context budget".into(),
+                ));
+            }
             Ok(
                 if recipient
                     .session
@@ -233,6 +262,7 @@ impl MessageBoardHost for LocalBoardHost {
                     .deliver_mailbox_communication_to_current_turn(
                         &recipient.session.active_turn,
                         communication,
+                        self.expected_turn_id.as_deref(),
                     )
                     .await
                 {

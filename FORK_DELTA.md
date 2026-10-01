@@ -91,3 +91,18 @@ Merge rule: when upstream adds or changes ThreadStore methods, update the wrappe
 Test expectation: RamJournal resolves to `RamJournalThreadStore`; Phase 01 delegate remains in-memory and carries no StateDbHandle.
 
 Snark note: owning the wrapper means future storage physics can change behind one seam instead of making `thread_manager.rs` participate in every new architectural hobby.
+
+
+### RAM-TS-005
+
+Upstream symbol: `ThreadStore::resume_thread` and snapshot revision fields on `ResumeThreadParams`, `StoredThreadHistory`, and `StoredModelContext`
+
+Fork behavior: preserve upstream's authoritative-resume contract, but validate RamJournal snapshots with `ResidentRevisionV1 { durable_sequence, durable_head_digest }`.
+
+Reason: cold-loaded state may become stale before live ownership is established. The live authority must publish a replay view proven current against the journal head.
+
+Fork implementation: `codex-rs/ram-authority/src/revision.rs`
+
+Merge rule: if upstream changes snapshot-validation semantics again, preserve the semantic requirement first. Do not inherit LocalThreadStore's filesystem-derived revision encoding unless the journal somehow develops an inode-based personality.
+
+Test expectation: RamJournal revisions round-trip through the opaque upstream slot; foreign revision namespaces are rejected and force canonical reload.

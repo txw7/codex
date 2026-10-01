@@ -58,3 +58,51 @@ Fork behavior: constructs the fork-owned RamJournal backend.
 Reason: keep backend composition at upstream's existing narrow boundary.
 
 Test expectation: Local and InMemory remain unchanged.
+
+
+## Phase 01 bootstrap status
+
+The first executable RamJournal slice is intentionally conservative:
+
+- config selects a distinct `RamJournal` backend;
+- core constructs it only at `thread_store_from_config()`;
+- the fork-owned crate currently delegates canonical thread storage to upstream `InMemoryThreadStore`;
+- RamJournal explicitly does **not** attach `StateDbHandle` to that thread store;
+- complete history is still fully expanded in RAM;
+- no journal, compression, memfd arena, residency eviction, or Factory authority protocol is claimed yet.
+
+This is a proof scaffold, not the final representation.
+
+The next phase replaces expanded resident history with `PendingTurnV1` plus terminal CJR commits. Until that work lands, any comment claiming one-turn-one-append would be marketing, and this fork has enough maintenance obligations without maintaining fictional accomplishments.
+
+
+### RAM-TS-004
+
+Upstream symbol: `codex_thread_store::ThreadStore`
+
+Fork behavior: wraps the complete current trait surface in `RamJournalThreadStore` while Phase 01 delegates semantics to upstream `InMemoryThreadStore`.
+
+Reason: core must see a fork-owned production backend identity before journal/residency behavior begins to diverge.
+
+Fork implementation: `codex-rs/ram-authority/src/thread_store.rs`
+
+Merge rule: when upstream adds or changes ThreadStore methods, update the wrapper deliberately. Do not allow a newly added upstream capability to vanish merely because the fork wrapper forgot it exists.
+
+Test expectation: RamJournal resolves to `RamJournalThreadStore`; Phase 01 delegate remains in-memory and carries no StateDbHandle.
+
+Snark note: owning the wrapper means future storage physics can change behind one seam instead of making `thread_manager.rs` participate in every new architectural hobby.
+
+
+### RAM-TS-005
+
+Upstream symbol: `ThreadStore::resume_thread` and snapshot revision fields on `ResumeThreadParams`, `StoredThreadHistory`, and `StoredModelContext`
+
+Fork behavior: preserve upstream's authoritative-resume contract, but validate RamJournal snapshots with `ResidentRevisionV1 { durable_sequence, durable_head_digest }`.
+
+Reason: cold-loaded state may become stale before live ownership is established. The live authority must publish a replay view proven current against the journal head.
+
+Fork implementation: `codex-rs/ram-authority/src/revision.rs`
+
+Merge rule: if upstream changes snapshot-validation semantics again, preserve the semantic requirement first. Do not inherit LocalThreadStore's filesystem-derived revision encoding unless the journal somehow develops an inode-based personality.
+
+Test expectation: RamJournal revisions round-trip through the opaque upstream slot; foreign revision namespaces are rejected and force canonical reload.

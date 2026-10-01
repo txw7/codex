@@ -562,6 +562,15 @@ pub struct ConfigToml {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThreadStoreToml {
     Local {},
+    // UPSTREAM-SEAM: RamJournal is a production fork backend selected through
+    // the same config boundary upstream already owns.
+    //
+    // Keep this variant boring. If upstream changes thread-store selection,
+    // move the adapter instead of teaching the rest of config about our storage
+    // religion.
+    RamJournal {
+        id: String,
+    },
     #[schemars(skip)]
     InMemory {
         id: String,
@@ -993,6 +1002,25 @@ mod tests {
 
     const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
     const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";
+
+    #[test]
+    fn ram_journal_thread_store_shape_round_trips_through_serde() {
+        let value = serde_json::json!({
+            "type": "ram_journal",
+            "id": "primary",
+        });
+        let parsed: ThreadStoreToml =
+            serde_json::from_value(value).expect("ram_journal thread-store config should parse");
+
+        // UPSTREAM-SEAM: This receipt protects only the config shape. Runtime
+        // authority belongs to codex-ram-authority and gets its own tests.
+        assert_eq!(
+            parsed,
+            ThreadStoreToml::RamJournal {
+                id: "primary".to_string(),
+            }
+        );
+    }
 
     #[test]
     fn sandbox_mode_uses_executor_platform_and_sandbox_level() {

@@ -13,10 +13,13 @@ mod decoded_context_cache;
 mod journal;
 mod pending_turn;
 mod resident_history;
+mod revision;
 mod thread_store;
 
 use codex_thread_store::ThreadStore;
 
+pub use revision::ResidentRevisionParseError;
+pub use revision::ResidentRevisionV1;
 pub use thread_store::RamJournalThreadStore;
 
 /// Build the Phase 01 RamJournal backend.
